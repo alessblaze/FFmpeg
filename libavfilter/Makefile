@@ -421,6 +421,7 @@ OBJS-$(CONFIG_OCV_FILTER)                    += vf_libopencv.o
 OBJS-$(CONFIG_OCIO_FILTER)                   += vf_opencolorio.o ocio_wrapper.o
 OBJS-$(CONFIG_OSCILLOSCOPE_FILTER)           += vf_datascope.o
 OBJS-$(CONFIG_OVERLAY_FILTER)                += vf_overlay.o framesync.o
+OBJS-$(CONFIG_OVERLAY_AMF_FILTER)            += vf_overlay_amf.o amf_overlay_compute.o framesync.o vf_amf_common.o
 OBJS-$(CONFIG_OVERLAY_CUDA_FILTER)           += vf_overlay_cuda.o framesync.o vf_overlay_cuda.ptx.o \
                                                 cuda/load_helper.o
 OBJS-$(CONFIG_OVERLAY_OPENCL_FILTER)         += vf_overlay_opencl.o opencl.o \

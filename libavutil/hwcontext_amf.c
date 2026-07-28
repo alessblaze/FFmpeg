@@ -441,6 +441,15 @@ static void amf_free_amfsurface(void *opaque, uint8_t *data)
     }
 }
 
+static uint8_t *amf_plane_data(AMFPlane *plane, uint8_t *base, int linesize)
+{
+    const int offset_x = plane->pVtbl->GetOffsetX(plane);
+    const int offset_y = plane->pVtbl->GetOffsetY(plane);
+    const int pixel_size = plane->pVtbl->GetPixelSizeInBytes(plane);
+
+    return base + offset_y * linesize + offset_x * pixel_size;
+}
+
 static int amf_transfer_data_to(AVHWFramesContext *ctx, AVFrame *dst,
                                  const AVFrame *src)
 {
@@ -464,7 +473,7 @@ static int amf_transfer_data_to(AVHWFramesContext *ctx, AVFrame *dst,
         res = amf_device_ctx->context->pVtbl->AllocSurface(amf_device_ctx->context, AMF_MEMORY_HOST, format, dst->width, dst->height, &surface);
         AMF_RETURN_IF_FALSE(ctx, res == AMF_OK, AVERROR(ENOMEM), "AllocSurface() failed  with error %d\n", res);
         dst->data[0] = (uint8_t *)surface;
-        dst->buf[1] = av_buffer_create((uint8_t *)surface, sizeof(surface),
+        dst->buf[1] = av_buffer_create((uint8_t *)surface, sizeof(*surface),
                                             amf_free_amfsurface,
                                             NULL,
                                             AV_BUFFER_FLAG_READONLY);
@@ -476,8 +485,10 @@ static int amf_transfer_data_to(AVHWFramesContext *ctx, AVFrame *dst,
 
     for (i = 0; i < planes; i++) {
         plane = surface->pVtbl->GetPlaneAt(surface, i);
-        dst_data[i] = plane->pVtbl->GetNative(plane);
         dst_linesize[i] = plane->pVtbl->GetHPitch(plane);
+        dst_data[i] = amf_plane_data(plane,
+                                     plane->pVtbl->GetNative(plane),
+                                     dst_linesize[i]);
     }
     av_image_copy2(dst_data, dst_linesize,
                    src->data, src->linesize, src->format,
@@ -490,14 +501,19 @@ static int amf_transfer_data_from(AVHWFramesContext *ctx, AVFrame *dst,
                                     const AVFrame *src)
 {
     AMFSurface* surface = (AMFSurface*)src->data[0];
+    AMFSurface1 *surface1 = NULL;
     AMFPlane *plane;
     uint8_t  *src_data[4];
     int       src_linesize[4];
     int       planes;
     int       i;
+    size_t    mapped_linesizes[4] = { 0 };
+    uint8_t  *mapped_data[4] = { 0 };
+    const AMFGuid guid = IID_AMFSurface1();
     int w = FFMIN(dst->width,  src->width);
     int h = FFMIN(dst->height, src->height);
     int ret;
+    AMF_RESULT res;
 
     if (src->hw_frames_ctx->data != (uint8_t *)ctx || dst->format != ctx->sw_format)
         return AVERROR(EINVAL);
@@ -505,17 +521,29 @@ static int amf_transfer_data_from(AVHWFramesContext *ctx, AVFrame *dst,
     ret = surface->pVtbl->Convert(surface, AMF_MEMORY_HOST);
     AMF_RETURN_IF_FALSE(ctx, ret == AMF_OK, AVERROR_UNKNOWN, "Convert(amf::AMF_MEMORY_HOST) failed with error %d\n", AVERROR_UNKNOWN);
 
+    res = AMF_IFACE_CALL(surface, QueryInterface, &guid, (void**)&surface1);
+    AMF_RETURN_IF_FALSE(ctx, res == AMF_OK, AVERROR_UNKNOWN, "QueryInterface(AMFSurface1) failed with error %d\n", res);
+
     planes = (int)surface->pVtbl->GetPlanesCount(surface);
     av_assert0(planes < FF_ARRAY_ELEMS(src_data));
 
+    res = AMF_IFACE_CALL(surface1, Map, AMF_MEMORY_CPU_READ, planes, mapped_linesizes, (void**)mapped_data);
+    if (res != AMF_OK) {
+        AMF_IFACE_CALL(surface1, Release);
+        AMF_RETURN_IF_FALSE(ctx, 0, AVERROR_UNKNOWN, "AMFSurface1->Map() failed with error %d\n", res);
+    }
+
     for (i = 0; i < planes; i++) {
         plane = surface->pVtbl->GetPlaneAt(surface, i);
-        src_data[i] = plane->pVtbl->GetNative(plane);
-        src_linesize[i] = plane->pVtbl->GetHPitch(plane);
+        src_linesize[i] = mapped_linesizes[i];
+        src_data[i] = amf_plane_data(plane, mapped_data[i], src_linesize[i]);
     }
     av_image_copy2(dst->data, dst->linesize,
                    src_data, src_linesize, dst->format,
                    w, h);
+
+    AMF_IFACE_CALL(surface1, Unmap);
+    AMF_IFACE_CALL(surface1, Release);
     return 0;
 }
 
@@ -873,8 +901,10 @@ static int amf_map_frame(AVHWFramesContext *device_ctx, AVFrame *dst, const AVFr
 
     for (int plane = 0; plane < plane_count; ++plane)
     {
-        dst->data[plane] = map[plane];
         dst->linesize[plane] = linesizes[plane];
+        dst->data[plane] = amf_plane_data(AMF_IFACE_CALL(surface, GetPlaneAt, plane),
+                                          map[plane],
+                                          linesizes[plane]);
     }
 
 fail:

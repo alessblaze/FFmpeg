@@ -312,12 +312,12 @@ static int amf_decode_init(AVCodecContext *avctx)
             int frames_w = 0;
             int frames_h = 0;
 
-            if (avctx->coded_width > 0 && avctx->coded_height > 0) {
-                frames_w = avctx->coded_width;
-                frames_h = avctx->coded_height;
-            } else if (avctx->width > 0 && avctx->height > 0) {
+            if (avctx->width > 0 && avctx->height > 0) {
                 frames_w = avctx->width;
                 frames_h = avctx->height;
+            } else if (avctx->coded_width > 0 && avctx->coded_height > 0) {
+                frames_w = avctx->coded_width;
+                frames_h = avctx->coded_height;
             } else {
                 frames_w = 1280;
                 frames_h = 720;
@@ -503,13 +503,31 @@ static int amf_attach_hdr_metadata(AVCodecContext *avctx, AMFSurface *surface, A
     return ret;
 }
 
+static uint8_t *amf_plane_data(AMFPlane *plane, uint8_t *base, int linesize)
+{
+    const int offset_x = plane->pVtbl->GetOffsetX(plane);
+    const int offset_y = plane->pVtbl->GetOffsetY(plane);
+    const int pixel_size = plane->pVtbl->GetPixelSizeInBytes(plane);
+
+    return base + offset_y * linesize + offset_x * pixel_size;
+}
+
 static int amf_amfsurface_to_avframe(AVCodecContext *avctx, AMFSurface* surface, AVFrame *frame)
 {
     AMFVariantStruct    var = {0};
     AMFPlane            *plane;
+    AMF_RESULT          res;
     int                 i;
     int                 ret;
     int                 format_amf;
+
+    if (avctx->width > 0 && avctx->height > 0) {
+        res = surface->pVtbl->SetCrop(surface, 0, 0, avctx->width, avctx->height);
+        if (res != AMF_OK) {
+            av_log(avctx, AV_LOG_VERBOSE, "SetCrop(%d,%d) failed with error %d\n",
+                   avctx->width, avctx->height, res);
+        }
+    }
 
     if (avctx->hw_device_ctx && ((AVHWDeviceContext*)avctx->hw_device_ctx->data)->type == AV_HWDEVICE_TYPE_AMF) {
         // prepare frame similar to  ff_get_buffer(avctx, frame, AV_GET_BUFFER_FLAG_REF);
@@ -527,7 +545,7 @@ static int amf_amfsurface_to_avframe(AVCodecContext *avctx, AMFSurface* surface,
         frame->height = avctx->height;
 
         ////
-        frame->buf[0] = av_buffer_create((uint8_t *)surface, sizeof(surface),
+        frame->buf[0] = av_buffer_create((uint8_t *)surface, sizeof(*surface),
                                     amf_free_amfsurface, (void*)avctx,
                                     AV_BUFFER_FLAG_READONLY);
         AMF_RETURN_IF_FALSE(avctx, !!frame->buf[0], AVERROR(ENOMEM), "av_buffer_create for amf surface failed.");
@@ -543,11 +561,13 @@ static int amf_amfsurface_to_avframe(AVCodecContext *avctx, AMFSurface* surface,
 
         for (i = 0; i < surface->pVtbl->GetPlanesCount(surface); i++) {
             plane = surface->pVtbl->GetPlaneAt(surface, i);
-            frame->data[i] = plane->pVtbl->GetNative(plane);
             frame->linesize[i] = plane->pVtbl->GetHPitch(plane);
+            frame->data[i] = amf_plane_data(plane,
+                                            plane->pVtbl->GetNative(plane),
+                                            frame->linesize[i]);
         }
 
-        frame->buf[0] = av_buffer_create((uint8_t *)surface, sizeof(surface),
+        frame->buf[0] = av_buffer_create((uint8_t *)surface, sizeof(*surface),
                                      amf_free_amfsurface, (void*)avctx,
                                      AV_BUFFER_FLAG_READONLY);
         AMF_RETURN_IF_FALSE(avctx, !!frame->buf[0], AVERROR(ENOMEM), "av_buffer_create for amf surface failed.");
@@ -558,6 +578,10 @@ static int amf_amfsurface_to_avframe(AVCodecContext *avctx, AMFSurface* surface,
 
     frame->width  = avctx->width;
     frame->height = avctx->height;
+    frame->crop_left = 0;
+    frame->crop_right = 0;
+    frame->crop_top = 0;
+    frame->crop_bottom = 0;
 
     frame->pts = surface->pVtbl->GetPts(surface);
 
@@ -654,23 +678,33 @@ static AMF_RESULT amf_buffer_from_packet(AVCodecContext *avctx, const AVPacket* 
     return amf_update_buffer_properties(avctx, buf, pkt);
 }
 
-static void amf_init_dimensions(AVCodecContext *avctx)
+static int amf_init_dimensions(AVCodecContext *avctx)
 {
     AMFDecoderContext *ctx = avctx->priv_data;
     AMFVariantStruct size_var = {0};
     AMF_RESULT res = AMF_OK;
+    int old_width = avctx->width;
+    int old_height = avctx->height;
 
     res = ctx->decoder->pVtbl->GetProperty(ctx->decoder, AMF_VIDEO_DECODER_CURRENT_SIZE, &size_var);
     if (res == AMF_OK && size_var.sizeValue.width > 0 && size_var.sizeValue.height > 0) {
         avctx->width        = size_var.sizeValue.width;
         avctx->height       = size_var.sizeValue.height;
-        avctx->coded_width  = size_var.sizeValue.width;
-        avctx->coded_height = size_var.sizeValue.height;
 
         ctx->dimensions_initialized = 1;
 
         av_log(avctx, AV_LOG_DEBUG, "AMF: detected initial decoder size %dx%d\n", avctx->width, avctx->height);
+
+        if (avctx->hw_frames_ctx &&
+            (old_width != avctx->width || old_height != avctx->height)) {
+            int sw_format = avctx->sw_pix_fmt != AV_PIX_FMT_NONE ? avctx->sw_pix_fmt : AV_PIX_FMT_NV12;
+            int ret = amf_reinit_frames_context(avctx, sw_format, avctx->width, avctx->height);
+            if (ret < 0)
+                return ret;
+        }
     }
+
+    return 0;
 }
 
 static int amf_decode_frame(AVCodecContext *avctx, struct AVFrame *frame)
@@ -736,8 +770,11 @@ static int amf_decode_frame(AVCodecContext *avctx, struct AVFrame *frame)
     res = amf_receive_frame(avctx, frame);
     if (res == AMF_OK) {
         got_frame = 1;
-        if (!ctx->dimensions_initialized)
-            amf_init_dimensions(avctx);
+        if (!ctx->dimensions_initialized) {
+            int ret = amf_init_dimensions(avctx);
+            if (ret < 0)
+                return ret;
+        }
     } else if (res == AMF_REPEAT)
         // decoder has no output yet
         res = AMF_OK;
@@ -766,7 +803,7 @@ static int amf_decode_frame(AVCodecContext *avctx, struct AVFrame *frame)
             if (res != AMF_OK) {
                 return AVERROR(EINVAL);
             }
-            int ret = amf_reinit_frames_context(avctx, av_amf_to_av_format(format_var.int64Value), avctx->coded_width, avctx->coded_height);
+            int ret = amf_reinit_frames_context(avctx, av_amf_to_av_format(format_var.int64Value), avctx->width, avctx->height);
             if (ret < 0)
                 return ret;
         } else

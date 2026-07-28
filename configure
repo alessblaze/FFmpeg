@@ -3575,6 +3575,8 @@ transpose_cuda_filter_deps="ffnvcodec"
 transpose_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
 overlay_cuda_filter_deps="ffnvcodec"
 overlay_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+overlay_amf_filter_deps="amf vulkan"
+overlay_amf_filter_extralibs="-lvulkan"
 pad_cuda_filter_deps="ffnvcodec"
 pad_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
 

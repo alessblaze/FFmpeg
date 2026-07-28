@@ -26092,6 +26092,64 @@ vpp_amf=color_profile=bt2020:in_trc=smpte2084:in_primaries=bt2020:out_trc=bt709:
 @end example
 @end itemize
 
+@anchor{overlay_amf}
+@section overlay_amf
+
+Overlay one AMF video stream on top of another.
+
+This filter operates on AMF hardware frames and currently supports packed RGB
+AMF surfaces only. Both inputs must use the same AMF surface format.
+
+The filter accepts the following options:
+@table @option
+@item x
+Set the horizontal position of the overlay. Default is 0.
+
+@item y
+Set the vertical position of the overlay. Default is 0.
+
+@item alpha_blend
+If set to 1, blend the overlay using its alpha channel on the GPU with a Vulkan
+compute shader.
+
+The fast alpha path currently requires @code{RGBA} AMF surfaces on both inputs.
+If @code{alpha_blend=0}, the overlay is copied opaquely and packed RGB AMF
+formats such as @code{BGRA}, @code{RGBA}, @code{BGR0}, and @code{RGB0} are
+accepted as long as both inputs match.
+
+@item eof_action
+@item shortest
+@item repeatlast
+Work the same as the equivalent options in the software @ref{overlay} filter.
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Opaque overlay on AMF hardware frames:
+@example
+ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
+    -c:v hevc_amf -i input.ts -loop 1 -i logo.png \
+    -filter_complex "[0:v]vpp_amf=format=bgra[main]; \
+                     [1:v]scale=320:-1,format=bgra,hwupload[ov]; \
+                     [main][ov]overlay_amf=x=64:y=64,vpp_amf=format=p010[out]" \
+    -map "[out]" -c:v hevc_amf output.ts
+@end example
+
+@item
+Alpha-blended overlay on the fast Vulkan compute path:
+@example
+ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
+    -c:v hevc_amf -i input.ts -loop 1 -i logo.png \
+    -filter_complex "[0:v]vpp_amf=format=rgba[main]; \
+                     [1:v]scale=320:-1,format=rgba,hwupload[ov]; \
+                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1, \
+                     vpp_amf=format=p010[out]" \
+    -map "[out]" -c:v hevc_amf output.ts
+@end example
+@end itemize
+
 @anchor{vstack}
 @section vstack
 Stack input videos vertically.
