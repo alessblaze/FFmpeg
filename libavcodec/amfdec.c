@@ -601,12 +601,16 @@ static int amf_amfsurface_to_avframe(AVCodecContext *avctx, AMFSurface* surface,
     return 0;
 }
 
-static AMF_RESULT amf_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+static AMF_RESULT amf_receive_surface(AVCodecContext *avctx, AMFSurface **surface)
 {
     AMFDecoderContext *ctx = avctx->priv_data;
     AMF_RESULT          ret = AMF_OK;
-    AMFSurface          *surface = NULL;
     AMFData             *data_out = NULL;
+
+    if (!surface)
+        return AMF_INVALID_ARG;
+
+    *surface = NULL;
 
     ret = ctx->decoder->pVtbl->QueryOutput(ctx->decoder, &data_out);
     if (ret != AMF_OK && ret != AMF_REPEAT) {
@@ -618,19 +622,9 @@ static AMF_RESULT amf_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
     if (data_out) {
         AMFGuid guid = IID_AMFSurface();
-        data_out->pVtbl->QueryInterface(data_out, &guid, (void**)&surface); // query for buffer interface
+        data_out->pVtbl->QueryInterface(data_out, &guid, (void**)surface); // query for buffer interface
         data_out->pVtbl->Release(data_out);
         data_out = NULL;
-    }
-
-    ret = amf_amfsurface_to_avframe(avctx, surface, frame);
-    AMF_GOTO_FAIL_IF_FALSE(avctx, ret >= 0, AMF_FAIL, "Failed to convert AMFSurface to AVFrame = %d\n", ret);
-    return AMF_OK;
-fail:
-
-    if (surface) {
-        surface->pVtbl->Release(surface);
-        surface = NULL;
     }
     return ret;
 }
@@ -711,6 +705,7 @@ static int amf_decode_frame(AVCodecContext *avctx, struct AVFrame *frame)
 {
     AMFDecoderContext *ctx = avctx->priv_data;
     AMFBuffer           *buf;
+    AMFSurface          *surface = NULL;
     AMF_RESULT          res;
     int                 got_frame = 0;
     AVPacket            *avpkt = ctx->in_pkt;
@@ -767,14 +762,32 @@ static int amf_decode_frame(AVCodecContext *avctx, struct AVFrame *frame)
         }
     }
 
-    res = amf_receive_frame(avctx, frame);
+    res = amf_receive_surface(avctx, &surface);
     if (res == AMF_OK) {
-        got_frame = 1;
-        if (!ctx->dimensions_initialized) {
-            int ret = amf_init_dimensions(avctx);
-            if (ret < 0)
-                return ret;
+        int ret;
+
+        if (!surface) {
+            av_log(avctx, AV_LOG_ERROR, "AMF returned AMF_OK without a surface\n");
+            return AVERROR_EXTERNAL;
         }
+
+        if (!ctx->dimensions_initialized) {
+            ret = amf_init_dimensions(avctx);
+            if (ret < 0) {
+                surface->pVtbl->Release(surface);
+                return ret;
+            }
+        }
+
+        ret = amf_amfsurface_to_avframe(avctx, surface, frame);
+        if (ret < 0) {
+            surface->pVtbl->Release(surface);
+            av_log(avctx, AV_LOG_ERROR,
+                   "Failed to convert AMFSurface to AVFrame = %d\n", ret);
+            return ret;
+        }
+
+        got_frame = 1;
     } else if (res == AMF_REPEAT)
         // decoder has no output yet
         res = AMF_OK;

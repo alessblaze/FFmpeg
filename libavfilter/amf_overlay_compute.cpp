@@ -16,9 +16,11 @@ extern "C" {
 
 #include <vulkan/vulkan.h>
 
+#include <cinttypes>
 #include <cstring>
 #include <cstdint>
 #include <new>
+#include <vector>
 
 struct FFAMFOverlayComputeContext {
     amf::AMFContext *context;
@@ -26,6 +28,7 @@ struct FFAMFOverlayComputeContext {
     amf::AMFContext1 *context1;
     amf::AMFVulkanDevice *device;
     VkQueue queue;
+    uint32_t queue_index;
     uint32_t queue_family_index;
     VkCommandPool command_pool;
     VkCommandBuffer command_buffer;
@@ -219,16 +222,51 @@ static amf::AMFVulkanView *get_packed_vulkan_view(amf::AMFSurface *surface, void
     return view;
 }
 
-static uint32_t find_queue_family_index(const amf::AMFVulkanDevice *device, VkQueue queue)
+static int get_compute_queue_index(FFAMFOverlayComputeContext *ctx, uint32_t *queue_index)
+{
+    amf_int64 queue_index64 = 0;
+    AMF_RESULT amf_res;
+
+    if (!ctx || !queue_index)
+        return AVERROR(EINVAL);
+
+    amf_res = ctx->context1->GetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, &queue_index64);
+    if (amf_res != AMF_OK) {
+        *queue_index = 0;
+        return 0;
+    }
+
+    if (queue_index64 < 0 || queue_index64 > UINT32_MAX) {
+        av_log(ctx->log_ctx, AV_LOG_ERROR,
+               "overlay_amf: invalid AMF Vulkan compute queue index %" PRId64 "\n",
+               (int64_t)queue_index64);
+        return AVERROR(EINVAL);
+    }
+
+    *queue_index = static_cast<uint32_t>(queue_index64);
+    return 0;
+}
+
+static uint32_t find_queue_family_index(const amf::AMFVulkanDevice *device, VkQueue queue,
+                                        uint32_t queue_index)
 {
     uint32_t family_count = 0;
+    std::vector<VkQueueFamilyProperties> family_props;
+
     vkGetPhysicalDeviceQueueFamilyProperties(device->hPhysicalDevice, &family_count, nullptr);
     if (!family_count)
         return UINT32_MAX;
 
+    family_props.resize(family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(device->hPhysicalDevice, &family_count,
+                                             family_props.data());
+
     for (uint32_t family = 0; family < family_count; family++) {
         VkQueue candidate = VK_NULL_HANDLE;
-        vkGetDeviceQueue(device->hDevice, family, 0, &candidate);
+        if (queue_index >= family_props[family].queueCount)
+            continue;
+
+        vkGetDeviceQueue(device->hDevice, family, queue_index, &candidate);
         if (candidate == queue)
             return family;
     }
@@ -645,6 +683,7 @@ extern "C" int ff_amf_overlay_compute_init(FFAMFOverlayComputeContext **ctx,
     compute_ctx->context1 = nullptr;
     compute_ctx->device = nullptr;
     compute_ctx->queue = VK_NULL_HANDLE;
+    compute_ctx->queue_index = 0;
     compute_ctx->queue_family_index = UINT32_MAX;
     compute_ctx->command_pool = VK_NULL_HANDLE;
     compute_ctx->command_buffer = VK_NULL_HANDLE;
@@ -687,18 +726,26 @@ extern "C" int ff_amf_overlay_compute_init(FFAMFOverlayComputeContext **ctx,
         return AVERROR_EXTERNAL;
     }
 
+    err = get_compute_queue_index(compute_ctx, &compute_ctx->queue_index);
+    if (err < 0) {
+        ff_amf_overlay_compute_uninit(&compute_ctx);
+        return err;
+    }
+
     compute_ctx->queue_family_index = find_queue_family_index(compute_ctx->device,
-                                                              compute_ctx->queue);
+                                                              compute_ctx->queue,
+                                                              compute_ctx->queue_index);
     if (compute_ctx->queue_family_index == UINT32_MAX) {
         av_log(log_ctx, AV_LOG_ERROR,
-               "overlay_amf: failed to match AMF Vulkan queue to a queue family\n");
+               "overlay_amf: failed to match AMF Vulkan queue to a queue family at queue index %u\n",
+               compute_ctx->queue_index);
         ff_amf_overlay_compute_uninit(&compute_ctx);
         return AVERROR_EXTERNAL;
     }
 
     av_log(log_ctx, AV_LOG_VERBOSE,
-           "overlay_amf: using AMF Compute::CopyPlane plus Vulkan compute alpha blend on queue family %u\n",
-           compute_ctx->queue_family_index);
+           "overlay_amf: using AMF Compute::CopyPlane plus Vulkan compute alpha blend on queue family %u queue index %u\n",
+           compute_ctx->queue_family_index, compute_ctx->queue_index);
 
     err = create_command_objects(compute_ctx);
     if (err < 0) {
