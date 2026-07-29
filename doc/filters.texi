@@ -26097,8 +26097,8 @@ vpp_amf=color_profile=bt2020:in_trc=smpte2084:in_primaries=bt2020:out_trc=bt709:
 
 Overlay one AMF video stream on top of another.
 
-This filter operates on AMF hardware frames and currently supports packed RGB
-AMF surfaces only. Both inputs must use the same AMF surface format.
+This filter operates on AMF hardware frames and supports packed RGB
+AMF surfaces on both inputs.
 If the negotiated inputs are not directly usable, the filter queries AMF
 VideoConverter caps on the active device and reports which @code{vpp_amf}
 conversion should be inserted before @code{overlay_amf}.
@@ -26115,19 +26115,31 @@ Set the vertical position of the overlay. Default is 0.
 If set to 1, blend the overlay using its alpha channel on the GPU with a Vulkan
 compute shader.
 
-The fast alpha path currently requires @code{RGBA} AMF surfaces on both inputs.
-If @code{alpha_blend=0}, the overlay is copied opaquely and packed RGB AMF
-formats such as @code{BGRA}, @code{RGBA}, @code{BGR0}, and @code{RGB0} are
-accepted as long as both inputs match.
+The fast alpha path accepts a packed RGB AMF surface on the main input and an
+alpha-bearing packed RGB AMF surface on the overlay input. This allows
+high-precision main surfaces such as @code{rgbaf16le} to
+blend with an @code{rgba} or @code{rgbaf16le} overlay without forcing the main
+path back through 8-bit @code{rgba}.
+If @code{alpha_blend=0}, the overlay is copied opaquely. Packed RGB AMF
+formats such as @code{BGRA}, @code{RGBA}, @code{BGR0}, @code{RGB0},
+and @code{rgbaf16le} are accepted as long as both inputs match.
 
 @item async_submit
-If set to 1 together with @code{alpha_blend=1}, submit the Vulkan alpha blend
-asynchronously and rely on AMF Vulkan surface sync metadata to carry the
-dependency downstream. Default is 0.
+If set to 1 together with @code{alpha_blend=1}, submit the packed RGB Vulkan
+alpha blend asynchronously and rely on AMF Vulkan surface sync metadata to
+carry the dependency downstream. Default is 0.
+
+@item alpha
+Set the overlay alpha mode used by @code{alpha_blend=1}. Accepted values are
+@code{auto} (default), @code{straight}, and @code{premultiplied}.
+
+With @code{alpha=auto}, @code{overlay_amf} follows FFmpeg's negotiated overlay
+alpha mode metadata when available and otherwise falls back to straight alpha.
 
 @item premultiplied
-If set to 1 together with @code{alpha_blend=1}, treat the overlay as
-premultiplied alpha before blending. Default is 0.
+Compatibility alias for @code{alpha}. Accepted values are @code{-1} for
+@code{auto}, @code{0} for @code{straight}, and @code{1} for
+@code{premultiplied}. Default is @code{-1}.
 
 @item global_alpha
 Scale the overlay alpha when @code{alpha_blend=1}. Range is from 0.0 to 1.0.
@@ -26160,7 +26172,7 @@ ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
     -c:v hevc_amf -i input.ts -loop 1 -i logo.png \
     -filter_complex "[0:v]vpp_amf=format=rgba[main]; \
                      [1:v]scale=320:-1,format=rgba,hwupload[ov]; \
-                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1, \
+                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1:alpha=straight, \
                      vpp_amf=format=p010[out]" \
     -map "[out]" -c:v hevc_amf output.ts
 @end example
@@ -26172,7 +26184,7 @@ ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
     -c:v hevc_amf -i input.ts -loop 1 -i logo.png \
     -filter_complex "[0:v]vpp_amf=format=rgba[main]; \
                      [1:v]scale=320:-1,format=rgba,hwupload[ov]; \
-                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1:premultiplied=1, \
+                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1:alpha=premultiplied, \
                      vpp_amf=format=p010[out]" \
     -map "[out]" -c:v hevc_amf output.ts
 @end example
@@ -26184,7 +26196,7 @@ ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
     -c:v hevc_amf -i input.ts -loop 1 -i logo.png \
     -filter_complex "[0:v]vpp_amf=format=rgba[main]; \
                      [1:v]scale=320:-1,format=rgba,hwupload[ov]; \
-                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1:premultiplied=1:global_alpha=0.75, \
+                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1:alpha=premultiplied:global_alpha=0.75, \
                      vpp_amf=format=p010[out]" \
     -map "[out]" -c:v hevc_amf output.ts
 @end example

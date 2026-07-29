@@ -35,6 +35,7 @@
 #include "avfilter.h"
 #include "avfilter_internal.h"
 #include "filters.h"
+#include "formats.h"
 #include "framesync.h"
 #include "vf_amf_common.h"
 
@@ -53,6 +54,7 @@ typedef struct OverlayAMFContext {
     int enable_alpha_blend;
     int async_submit;
     int premultiplied_alpha;
+    int alpha_mode;
     float global_alpha;
     enum AMF_SURFACE_FORMAT main_surface_format;
 } OverlayAMFContext;
@@ -68,6 +70,43 @@ static const char *overlay_amf_pix_fmt_name(enum AVPixelFormat fmt)
     return name ? name : "unknown";
 }
 
+static int overlay_amf_requested_alpha_mode(const OverlayAMFContext *ctx)
+{
+    if (ctx->alpha_mode != AVALPHA_MODE_UNSPECIFIED)
+        return ctx->alpha_mode;
+
+    if (ctx->premultiplied_alpha >= 0)
+        return ctx->premultiplied_alpha ? AVALPHA_MODE_PREMULTIPLIED
+                                        : AVALPHA_MODE_STRAIGHT;
+
+    return AVALPHA_MODE_UNSPECIFIED;
+}
+
+static int overlay_amf_resolve_premultiplied_alpha(AVFilterContext *avctx,
+                                                    const AVFrame *overlay)
+{
+    OverlayAMFContext *ctx = avctx->priv;
+    int requested_alpha_mode = overlay_amf_requested_alpha_mode(ctx);
+
+    if (ctx->alpha_mode != AVALPHA_MODE_UNSPECIFIED &&
+        ctx->premultiplied_alpha >= 0 &&
+        ctx->premultiplied_alpha != (ctx->alpha_mode == AVALPHA_MODE_PREMULTIPLIED)) {
+        av_log(avctx, AV_LOG_WARNING,
+               "overlay_amf: alpha=%s overrides conflicting premultiplied=%d\n",
+               av_alpha_mode_name(ctx->alpha_mode), ctx->premultiplied_alpha);
+    }
+
+    if (requested_alpha_mode == AVALPHA_MODE_PREMULTIPLIED)
+        return 1;
+    if (requested_alpha_mode == AVALPHA_MODE_STRAIGHT)
+        return 0;
+
+    if (overlay && overlay->alpha_mode == AVALPHA_MODE_PREMULTIPLIED)
+        return 1;
+
+    return 0;
+}
+
 static int overlay_amf_is_supported_sw_format(enum AVPixelFormat fmt)
 {
     switch (fmt) {
@@ -75,10 +114,17 @@ static int overlay_amf_is_supported_sw_format(enum AVPixelFormat fmt)
     case AV_PIX_FMT_RGBA:
     case AV_PIX_FMT_BGR0:
     case AV_PIX_FMT_RGB0:
+    case AV_PIX_FMT_RGBAF16:
         return 1;
     default:
         return 0;
     }
+}
+
+static int overlay_amf_sw_format_has_alpha(enum AVPixelFormat fmt)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
+    return desc && !!(desc->flags & AV_PIX_FMT_FLAG_ALPHA);
 }
 
 static AVAMFDeviceContext *overlay_amf_get_device_ctx(AVHWFramesContext *frames_ctx)
@@ -282,6 +328,8 @@ static int overlay_amf_output_surface(AVFilterContext *avctx, AVFilterLink *outl
         return AVERROR(ENOMEM);
     }
 
+    out->alpha_mode = outlink->alpha_mode;
+
     *main_surface = NULL;
     av_frame_free(&input_main);
     return ff_filter_frame(outlink, out);
@@ -297,6 +345,7 @@ static int overlay_amf_blend(FFFrameSync *fs)
     AVFrame *input_overlay = NULL;
     AMFSurface *main_surface = NULL;
     AMFSurface *overlay_surface = NULL;
+    int premultiplied_alpha = 0;
 
     ret = ff_framesync_dualinput_get(fs, &input_main, &input_overlay);
     if (ret < 0)
@@ -322,6 +371,9 @@ static int overlay_amf_blend(FFFrameSync *fs)
     if (ret < 0)
         goto fail;
 
+    premultiplied_alpha = overlay_amf_resolve_premultiplied_alpha(avctx,
+                                                                  input_overlay);
+
     ret = ff_amf_overlay_compute_run(ctx->compute,
                                      main_surface,
                                      overlay_surface,
@@ -334,7 +386,7 @@ static int overlay_amf_blend(FFFrameSync *fs)
                                      ctx->overlay_has_alpha,
                                      ctx->enable_alpha_blend,
                                      ctx->async_submit,
-                                     ctx->premultiplied_alpha,
+                                     premultiplied_alpha,
                                      ctx->global_alpha);
     if (ret < 0)
         goto fail;
@@ -371,7 +423,8 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     AVAMFDeviceContext *device_ctx;
     enum AVPixelFormat in_format;
     enum AVPixelFormat preferred_sw_format;
-    enum AMF_SURFACE_FORMAT overlay_surface_format;
+    int main_is_packed_rgb;
+    int overlay_is_packed_rgb;
     int ret;
 
     if (!main_inl->hw_frames_ctx || !overlay_inl->hw_frames_ctx) {
@@ -383,25 +436,29 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     overlay_fc = (AVHWFramesContext *)overlay_inl->hw_frames_ctx->data;
     device_ctx = overlay_amf_get_device_ctx(main_fc);
     preferred_sw_format = ctx->enable_alpha_blend ? AV_PIX_FMT_RGBA : AV_PIX_FMT_BGRA;
+    main_is_packed_rgb = overlay_amf_is_supported_sw_format(main_fc->sw_format);
+    overlay_is_packed_rgb = overlay_amf_is_supported_sw_format(overlay_fc->sw_format);
 
-    if (!overlay_amf_is_supported_sw_format(main_fc->sw_format) ||
-        !overlay_amf_is_supported_sw_format(overlay_fc->sw_format)) {
+    if (!main_is_packed_rgb ||
+        !overlay_is_packed_rgb) {
         av_log(avctx, AV_LOG_ERROR,
-               "overlay_amf currently supports packed RGB AMF surfaces only; got %s and %s\n",
+               "overlay_amf currently supports packed RGB AMF surfaces on both inputs; got %s and %s\n",
                overlay_amf_pix_fmt_name(main_fc->sw_format),
                overlay_amf_pix_fmt_name(overlay_fc->sw_format));
-        if (!overlay_amf_is_supported_sw_format(main_fc->sw_format))
+        if (!main_is_packed_rgb)
             overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
                                             preferred_sw_format, "main");
-        if (!overlay_amf_is_supported_sw_format(overlay_fc->sw_format))
+        if (!overlay_is_packed_rgb)
             overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
                                             preferred_sw_format, "overlay");
         return AVERROR(ENOSYS);
     }
 
     ctx->main_surface_format = av_av_to_amf_format(main_fc->sw_format);
-    overlay_surface_format = av_av_to_amf_format(overlay_fc->sw_format);
-    if (ctx->main_surface_format != overlay_surface_format) {
+    ctx->overlay_has_alpha = overlay_amf_sw_format_has_alpha(overlay_fc->sw_format);
+
+    if (main_is_packed_rgb && !ctx->enable_alpha_blend &&
+        ctx->main_surface_format != av_av_to_amf_format(overlay_fc->sw_format)) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf requires matching AMF surface formats; got %s and %s\n",
                overlay_amf_pix_fmt_name(main_fc->sw_format),
@@ -411,24 +468,16 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
-    if (ctx->enable_alpha_blend &&
-        (main_fc->sw_format != AV_PIX_FMT_RGBA ||
-         overlay_fc->sw_format != AV_PIX_FMT_RGBA)) {
+    if (main_is_packed_rgb && ctx->enable_alpha_blend &&
+        !ctx->overlay_has_alpha) {
         av_log(avctx, AV_LOG_ERROR,
-               "overlay_amf alpha_blend=1 currently requires RGBA AMF surfaces on both inputs; got %s and %s\n",
-               overlay_amf_pix_fmt_name(main_fc->sw_format),
-               overlay_amf_pix_fmt_name(overlay_fc->sw_format));
-        if (main_fc->sw_format != AV_PIX_FMT_RGBA)
-            overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
-                                            AV_PIX_FMT_RGBA, "main");
-        if (overlay_fc->sw_format != AV_PIX_FMT_RGBA)
-            overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
-                                            AV_PIX_FMT_RGBA, "overlay");
+               "overlay_amf alpha_blend=1 requires an alpha-bearing packed RGB overlay surface; got %s over %s\n",
+               overlay_amf_pix_fmt_name(overlay_fc->sw_format),
+               overlay_amf_pix_fmt_name(main_fc->sw_format));
+        overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
+                                        AV_PIX_FMT_RGBA, "overlay");
         return AVERROR(ENOSYS);
     }
-
-    ctx->overlay_has_alpha = overlay_fc->sw_format == AV_PIX_FMT_BGRA ||
-                             overlay_fc->sw_format == AV_PIX_FMT_RGBA;
 
     ctx->common.width = main_inlink->w;
     ctx->common.height = main_inlink->h;
@@ -439,8 +488,19 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     case AMF_SURFACE_RGBA:
         ctx->common.format = AV_PIX_FMT_RGBA;
         break;
+    case AMF_SURFACE_ARGB:
+        ctx->common.format = AV_PIX_FMT_BGRA;
+        break;
+    case AMF_SURFACE_RGBA_F16:
+        ctx->common.format = AV_PIX_FMT_RGBAF16;
+        break;
     default:
-        ctx->common.format = AV_PIX_FMT_NONE;
+        if (main_fc->sw_format == AV_PIX_FMT_BGR0)
+            ctx->common.format = AV_PIX_FMT_BGRA;
+        else if (main_fc->sw_format == AV_PIX_FMT_RGB0)
+            ctx->common.format = AV_PIX_FMT_RGBA;
+        else
+            ctx->common.format = AV_PIX_FMT_NONE;
         break;
     }
     ctx->common.reset_sar = 0;
@@ -463,6 +523,36 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
         return ret;
 
     return ff_framesync_configure(&ctx->fs);
+}
+
+static int overlay_amf_query_formats(const AVFilterContext *avctx,
+                                     AVFilterFormatsConfig **cfg_in,
+                                     AVFilterFormatsConfig **cfg_out)
+{
+    const OverlayAMFContext *ctx = avctx->priv;
+    AVFilterFormats *main_and_output_alpha_modes = NULL;
+    AVFilterFormats *overlay_alpha_modes = NULL;
+    int alpha_mode = overlay_amf_requested_alpha_mode(ctx);
+    int ret;
+
+    ret = ff_set_common_formats2(avctx, cfg_in, cfg_out,
+                                 ff_make_formats_list_singleton(AV_PIX_FMT_AMF_SURFACE));
+    if (ret < 0)
+        return ret;
+
+    main_and_output_alpha_modes = ff_all_alpha_modes();
+    ret = ff_formats_ref(main_and_output_alpha_modes, &cfg_in[MAIN]->alpha_modes);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_formats_ref(main_and_output_alpha_modes, &cfg_out[0]->alpha_modes);
+    if (ret < 0)
+        return ret;
+
+    overlay_alpha_modes = alpha_mode != AVALPHA_MODE_UNSPECIFIED ?
+                          ff_make_formats_list_singleton(alpha_mode) :
+                          ff_all_alpha_modes();
+    return ff_formats_ref(overlay_alpha_modes, &cfg_in[OVERLAY]->alpha_modes);
 }
 
 static av_cold int overlay_amf_init(AVFilterContext *avctx)
@@ -496,7 +586,12 @@ static const AVOption overlay_amf_options[] = {
     { "y", "Overlay y position", OFFSET(y_position), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, FLAGS },
     { "alpha_blend", "Blend overlay alpha instead of copying it opaquely", OFFSET(enable_alpha_blend), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { "async_submit", "Submit alpha_blend Vulkan work asynchronously when AMF Vulkan sync is available", OFFSET(async_submit), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
-    { "premultiplied", "Treat overlay alpha as premultiplied when alpha_blend=1", OFFSET(premultiplied_alpha), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "alpha", "alpha format", OFFSET(alpha_mode), AV_OPT_TYPE_INT, { .i64 = AVALPHA_MODE_UNSPECIFIED }, 0, AVALPHA_MODE_NB - 1, FLAGS, .unit = "alpha_mode" },
+        { "auto",          "", 0, AV_OPT_TYPE_CONST, { .i64 = AVALPHA_MODE_UNSPECIFIED },   .flags = FLAGS, .unit = "alpha_mode" },
+        { "unknown",       "", 0, AV_OPT_TYPE_CONST, { .i64 = AVALPHA_MODE_UNSPECIFIED },   .flags = FLAGS, .unit = "alpha_mode" },
+        { "straight",      "", 0, AV_OPT_TYPE_CONST, { .i64 = AVALPHA_MODE_STRAIGHT },      .flags = FLAGS, .unit = "alpha_mode" },
+        { "premultiplied", "", 0, AV_OPT_TYPE_CONST, { .i64 = AVALPHA_MODE_PREMULTIPLIED }, .flags = FLAGS, .unit = "alpha_mode" },
+    { "premultiplied", "Compatibility alias for alpha mode: -1=auto, 0=straight, 1=premultiplied", OFFSET(premultiplied_alpha), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, FLAGS },
     { "global_alpha", "Scale overlay alpha when alpha_blend=1", OFFSET(global_alpha), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0.0, 1.0, FLAGS },
     { "eof_action", "Action to take when encountering EOF from secondary input ",
         OFFSET(fs.opt_eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_REPEAT },
@@ -540,8 +635,8 @@ const FFFilter ff_vf_overlay_amf = {
     .init           = overlay_amf_init,
     .uninit         = overlay_amf_uninit,
     .activate       = overlay_amf_activate,
+    FILTER_QUERY_FUNC2(overlay_amf_query_formats),
     FILTER_INPUTS(overlay_amf_inputs),
     FILTER_OUTPUTS(overlay_amf_outputs),
-    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_AMF_SURFACE),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

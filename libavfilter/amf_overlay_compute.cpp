@@ -23,7 +23,7 @@ extern "C" {
 #include <vector>
 
 static const unsigned OVERLAY_AMF_MAX_ASYNC_JOBS = 4;
-static const unsigned OVERLAY_AMF_MAX_SYNC_RESOURCES = 2;
+static const unsigned OVERLAY_AMF_MAX_SYNC_RESOURCES = 4;
 
 typedef struct OverlayAlphaPushConstants {
     int32_t dst_origin[2];
@@ -70,7 +70,6 @@ struct FFAMFOverlayComputeContext {
     VkPipelineLayout alpha_pipeline_layout;
     VkPipeline alpha_pipeline;
     VkShaderModule alpha_comp_module;
-    VkFormat alpha_pipeline_format;
 
     void (*lock)(void *lock_ctx);
     void (*unlock)(void *lock_ctx);
@@ -174,7 +173,6 @@ static void destroy_alpha_pipeline(FFAMFOverlayComputeContext *ctx)
         vkDestroyPipeline(ctx->device->hDevice, ctx->alpha_pipeline, nullptr);
 
     ctx->alpha_pipeline = VK_NULL_HANDLE;
-    ctx->alpha_pipeline_format = VK_FORMAT_UNDEFINED;
 }
 
 static void destroy_alpha_objects(FFAMFOverlayComputeContext *ctx)
@@ -202,6 +200,8 @@ static void destroy_alpha_objects(FFAMFOverlayComputeContext *ctx)
 static void log_surface_plane_info(const char *label, amf::AMFSurface *surface, void *log_ctx)
 {
     amf::AMFPlane *packed;
+    amf::AMFPlane *plane_y;
+    amf::AMFPlane *plane_uv;
     void *native = nullptr;
     int plane_count;
     int pixel_size = -1;
@@ -215,6 +215,8 @@ static void log_surface_plane_info(const char *label, amf::AMFSurface *surface, 
 
     plane_count = (int)surface->GetPlanesCount();
     packed = surface->GetPlane(amf::AMF_PLANE_PACKED);
+    plane_y = surface->GetPlane(amf::AMF_PLANE_Y);
+    plane_uv = surface->GetPlane(amf::AMF_PLANE_UV);
     if (packed) {
         native = packed->GetNative();
         pixel_size = packed->GetPixelSizeInBytes();
@@ -239,6 +241,36 @@ static void log_surface_plane_info(const char *label, amf::AMFSurface *surface, 
            packed ? packed->GetOffsetX() : -1,
            packed ? packed->GetOffsetY() : -1,
            tiled);
+
+    if (plane_y) {
+        av_log(log_ctx, AV_LOG_VERBOSE,
+               "overlay_amf: %s Y plane native=%p pixel=%d pitch=%d vpitch=%d size=%dx%d offset=(%d,%d) tiled=%d\n",
+               label,
+               plane_y->GetNative(),
+               plane_y->GetPixelSizeInBytes(),
+               plane_y->GetHPitch(),
+               plane_y->GetVPitch(),
+               plane_y->GetWidth(),
+               plane_y->GetHeight(),
+               plane_y->GetOffsetX(),
+               plane_y->GetOffsetY(),
+               plane_y->IsTiled());
+    }
+
+    if (plane_uv) {
+        av_log(log_ctx, AV_LOG_VERBOSE,
+               "overlay_amf: %s UV plane native=%p pixel=%d pitch=%d vpitch=%d size=%dx%d offset=(%d,%d) tiled=%d\n",
+               label,
+               plane_uv->GetNative(),
+               plane_uv->GetPixelSizeInBytes(),
+               plane_uv->GetHPitch(),
+               plane_uv->GetVPitch(),
+               plane_uv->GetWidth(),
+               plane_uv->GetHeight(),
+               plane_uv->GetOffsetX(),
+               plane_uv->GetOffsetY(),
+               plane_uv->IsTiled());
+    }
 }
 
 static int interop_or_convert_surface(amf::AMFSurface *surface, amf::AMF_MEMORY_TYPE type,
@@ -255,7 +287,10 @@ static int interop_or_convert_surface(amf::AMFSurface *surface, amf::AMF_MEMORY_
     return 0;
 }
 
-static amf::AMFVulkanView *get_packed_vulkan_view(amf::AMFSurface *surface, void *log_ctx)
+static amf::AMFVulkanView *get_plane_vulkan_view(amf::AMFSurface *surface,
+                                                 amf::AMF_PLANE_TYPE plane_type,
+                                                 const char *plane_name,
+                                                 void *log_ctx)
 {
     if (surface->GetDataType() != amf::AMF_DATA_SURFACE) {
         av_log(log_ctx, AV_LOG_ERROR, "AMF overlay expected AMF_DATA_SURFACE, got %d\n",
@@ -270,20 +305,27 @@ static amf::AMFVulkanView *get_packed_vulkan_view(amf::AMFSurface *surface, void
             return nullptr;
     }
 
-    amf::AMFPlane *plane = surface->GetPlane(amf::AMF_PLANE_PACKED);
+    amf::AMFPlane *plane = surface->GetPlane(plane_type);
     if (!plane) {
-        av_log(log_ctx, AV_LOG_ERROR, "AMF overlay requires packed RGB Vulkan surfaces\n");
+        av_log(log_ctx, AV_LOG_ERROR,
+               "AMF overlay requires Vulkan view on %s plane\n", plane_name);
         return nullptr;
     }
 
     auto *view = reinterpret_cast<amf::AMFVulkanView *>(plane->GetNative());
     if (!view || !view->pSurface || !view->hView) {
         av_log(log_ctx, AV_LOG_ERROR,
-               "AMF Vulkan packed plane did not expose a native image view\n");
+               "AMF Vulkan %s plane did not expose a native image view\n",
+               plane_name);
         return nullptr;
     }
 
     return view;
+}
+
+static amf::AMFVulkanView *get_packed_vulkan_view(amf::AMFSurface *surface, void *log_ctx)
+{
+    return get_plane_vulkan_view(surface, amf::AMF_PLANE_PACKED, "packed", log_ctx);
 }
 
 static int get_compute_queue_index(FFAMFOverlayComputeContext *ctx, uint32_t *queue_index)
@@ -509,7 +551,7 @@ static int create_shader_module(FFAMFOverlayComputeContext *ctx,
 static int create_alpha_resources(FFAMFOverlayComputeContext *ctx)
 {
     VkSamplerCreateInfo sampler_info = {};
-    VkDescriptorSetLayoutBinding bindings[2] = {};
+    VkDescriptorSetLayoutBinding bindings[3] = {};
     VkDescriptorSetLayoutCreateInfo set_layout_info = {};
     VkPushConstantRange push_range = {};
     VkPipelineLayoutCreateInfo layout_info = {};
@@ -537,12 +579,17 @@ static int create_alpha_resources(FFAMFOverlayComputeContext *ctx)
     bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[1].descriptorCount = 1;
     bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    bindings[2].binding = 2;
+    bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[2].descriptorCount = 1;
+    bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
     set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set_layout_info.bindingCount = 2;
+    set_layout_info.bindingCount = 3;
     set_layout_info.pBindings = bindings;
 
     res = vkCreateDescriptorSetLayout(ctx->device->hDevice, &set_layout_info, nullptr,
@@ -566,16 +613,15 @@ static int create_alpha_resources(FFAMFOverlayComputeContext *ctx)
         return vk_result_to_averror(ctx->log_ctx, "vkCreatePipelineLayout", res);
 
     /*
-     * The fast alpha path uses a compute shader on the AMF queue. The shader
-     * is currently authored for rgba8 storage images, so alpha blending is
-     * intentionally restricted to RGBA surfaces.
+     * The fast alpha path binds the main surface as separate readonly and
+     * writeonly storage images. This keeps the shader formatless, so the same
+     * SPIR-V module can blend packed 8-bit, 10-bit and fp16 AMF Vulkan views.
      */
     err = create_shader_module(ctx, overlay_amf_alpha_comp_spv, overlay_amf_alpha_comp_spv_len,
                                &ctx->alpha_comp_module, "vkCreateShaderModule(comp)");
     if (err < 0)
         return err;
 
-    ctx->alpha_pipeline_format = VK_FORMAT_UNDEFINED;
     return 0;
 }
 
@@ -587,7 +633,7 @@ static int create_alpha_job_descriptors(FFAMFOverlayComputeContext *ctx, Overlay
     VkResult res;
 
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    pool_sizes[0].descriptorCount = 1;
+    pool_sizes[0].descriptorCount = 2;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     pool_sizes[1].descriptorCount = 1;
 
@@ -638,13 +684,13 @@ static int create_alpha_jobs(FFAMFOverlayComputeContext *ctx)
     return 0;
 }
 
-static int ensure_alpha_pipeline(FFAMFOverlayComputeContext *ctx, VkFormat format)
+static int ensure_alpha_pipeline(FFAMFOverlayComputeContext *ctx)
 {
     VkPipelineShaderStageCreateInfo stage = {};
     VkComputePipelineCreateInfo pipeline_info = {};
     VkResult res;
 
-    if (ctx->alpha_pipeline && ctx->alpha_pipeline_format == format)
+    if (ctx->alpha_pipeline)
         return 0;
 
     destroy_alpha_pipeline(ctx);
@@ -663,7 +709,6 @@ static int ensure_alpha_pipeline(FFAMFOverlayComputeContext *ctx, VkFormat forma
     if (res != VK_SUCCESS)
         return vk_result_to_averror(ctx->log_ctx, "vkCreateComputePipelines", res);
 
-    ctx->alpha_pipeline_format = format;
     return 0;
 }
 
@@ -792,8 +837,8 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
     OverlayAlphaJob *job;
     OverlayPendingSync pending_syncs[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
     VkCommandBufferBeginInfo begin_info = {};
-    VkDescriptorImageInfo image_infos[2] = {};
-    VkWriteDescriptorSet writes[2] = {};
+    VkDescriptorImageInfo image_infos[3] = {};
+    VkWriteDescriptorSet writes[3] = {};
     OverlayAlphaPushConstants push = {};
     VkSubmitInfo submit = {};
     VkTimelineSemaphoreSubmitInfo timeline_submit = {};
@@ -811,7 +856,7 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
     VkResult res;
     int err;
 
-    err = ensure_alpha_pipeline(ctx, (VkFormat)main_view->pSurface->eFormat);
+    err = ensure_alpha_pipeline(ctx);
     if (err < 0)
         return err;
 
@@ -867,9 +912,11 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
 
     image_infos[0].imageView = main_view->hView;
     image_infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    image_infos[1].sampler = ctx->alpha_sampler;
-    image_infos[1].imageView = overlay_view->hView;
-    image_infos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    image_infos[1].imageView = main_view->hView;
+    image_infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_infos[2].sampler = ctx->alpha_sampler;
+    image_infos[2].imageView = overlay_view->hView;
+    image_infos[2].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = job->desc_set;
@@ -881,9 +928,15 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
     writes[1].dstSet = job->desc_set;
     writes[1].dstBinding = 1;
     writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     writes[1].pImageInfo = &image_infos[1];
-    vkUpdateDescriptorSets(ctx->device->hDevice, 2, writes, 0, nullptr);
+    writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[2].dstSet = job->desc_set;
+    writes[2].dstBinding = 2;
+    writes[2].descriptorCount = 1;
+    writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[2].pImageInfo = &image_infos[2];
+    vkUpdateDescriptorSets(ctx->device->hDevice, 3, writes, 0, nullptr);
 
     push.dst_origin[0] = dst_offset->x;
     push.dst_origin[1] = dst_offset->y;
@@ -1159,7 +1212,6 @@ extern "C" int ff_amf_overlay_compute_init(FFAMFOverlayComputeContext **ctx,
     compute_ctx->alpha_pipeline_layout = VK_NULL_HANDLE;
     compute_ctx->alpha_pipeline = VK_NULL_HANDLE;
     compute_ctx->alpha_comp_module = VK_NULL_HANDLE;
-    compute_ctx->alpha_pipeline_format = VK_FORMAT_UNDEFINED;
     compute_ctx->lock = device_ctx->lock;
     compute_ctx->unlock = device_ctx->unlock;
     compute_ctx->lock_ctx = device_ctx->lock_ctx;
@@ -1281,15 +1333,6 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
     log_surface_plane_info("overlay", overlay_surface, ctx->log_ctx);
     log_surface_plane_info("out", main_surface, ctx->log_ctx);
 
-    main_plane = main_surface->GetPlane(amf::AMF_PLANE_PACKED);
-    overlay_plane = overlay_surface->GetPlane(amf::AMF_PLANE_PACKED);
-    if (!main_plane || !overlay_plane) {
-        av_log(ctx->log_ctx, AV_LOG_ERROR,
-               "overlay_amf: missing packed RGB plane on one of the AMF surfaces\n");
-        err = AVERROR(EINVAL);
-        goto fail;
-    }
-
     if (!clamp_overlay_region(main_width, main_height,
                               overlay_width, overlay_height,
                               x_position, y_position,
@@ -1301,6 +1344,15 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
         if (ctx->unlock)
             ctx->unlock(ctx->lock_ctx);
         return 0;
+    }
+
+    main_plane = main_surface->GetPlane(amf::AMF_PLANE_PACKED);
+    overlay_plane = overlay_surface->GetPlane(amf::AMF_PLANE_PACKED);
+    if (!main_plane || !overlay_plane) {
+        av_log(ctx->log_ctx, AV_LOG_ERROR,
+               "overlay_amf: missing packed RGB plane on one of the AMF surfaces\n");
+        err = AVERROR(EINVAL);
+        goto fail;
     }
 
     if (overlay_has_alpha && enable_alpha_blend) {

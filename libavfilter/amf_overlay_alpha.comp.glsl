@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_image_load_formatted : require
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
@@ -12,8 +13,9 @@ layout(push_constant) uniform Push {
     float global_alpha;
 } pc;
 
-layout(set = 0, binding = 0, rgba8) uniform image2D mainImage;
-layout(set = 0, binding = 1) uniform sampler2D overlayTex;
+layout(set = 0, binding = 0) uniform readonly image2D mainInputImage;
+layout(set = 0, binding = 1) uniform writeonly image2D mainOutputImage;
+layout(set = 0, binding = 2) uniform sampler2D overlayTex;
 
 void main()
 {
@@ -25,7 +27,7 @@ void main()
     ivec2 src_pos = pc.src_origin + gid;
 
     vec4 src = texelFetch(overlayTex, src_pos, 0);
-    vec4 dstc = imageLoad(mainImage, dst);
+    vec4 dstc = imageLoad(mainInputImage, dst);
     float alpha = src.a;
     vec3 src_rgb = src.rgb;
 
@@ -35,5 +37,5 @@ void main()
     alpha *= pc.global_alpha;
 
     vec3 out_rgb = src_rgb * alpha + dstc.rgb * (1.0 - alpha);
-    imageStore(mainImage, dst, vec4(out_rgb, dstc.a));
+    imageStore(mainOutputImage, dst, vec4(out_rgb, dstc.a));
 }
