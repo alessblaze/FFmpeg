@@ -26099,6 +26099,9 @@ Overlay one AMF video stream on top of another.
 
 This filter operates on AMF hardware frames and currently supports packed RGB
 AMF surfaces only. Both inputs must use the same AMF surface format.
+If the negotiated inputs are not directly usable, the filter queries AMF
+VideoConverter caps on the active device and reports which @code{vpp_amf}
+conversion should be inserted before @code{overlay_amf}.
 
 The filter accepts the following options:
 @table @option
@@ -26116,6 +26119,11 @@ The fast alpha path currently requires @code{RGBA} AMF surfaces on both inputs.
 If @code{alpha_blend=0}, the overlay is copied opaquely and packed RGB AMF
 formats such as @code{BGRA}, @code{RGBA}, @code{BGR0}, and @code{RGB0} are
 accepted as long as both inputs match.
+
+@item async_submit
+If set to 1 together with @code{alpha_blend=1}, submit the Vulkan alpha blend
+asynchronously and rely on AMF Vulkan surface sync metadata to carry the
+dependency downstream. Default is 0.
 
 @item premultiplied
 If set to 1 together with @code{alpha_blend=1}, treat the overlay as

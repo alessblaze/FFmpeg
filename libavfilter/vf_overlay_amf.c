@@ -28,6 +28,9 @@
 #include "libavutil/hwcontext_amf.h"
 #include "libavutil/hwcontext_amf_internal.h"
 
+#include "AMF/components/ComponentCaps.h"
+#include "AMF/components/VideoConverter.h"
+
 #include "amf_overlay_compute.h"
 #include "avfilter.h"
 #include "avfilter_internal.h"
@@ -48,10 +51,22 @@ typedef struct OverlayAMFContext {
     int y_position;
     int overlay_has_alpha;
     int enable_alpha_blend;
+    int async_submit;
     int premultiplied_alpha;
     float global_alpha;
     enum AMF_SURFACE_FORMAT main_surface_format;
 } OverlayAMFContext;
+
+typedef struct OverlayAMFFormatSupport {
+    int supported;
+    int native;
+} OverlayAMFFormatSupport;
+
+static const char *overlay_amf_pix_fmt_name(enum AVPixelFormat fmt)
+{
+    const char *name = av_get_pix_fmt_name(fmt);
+    return name ? name : "unknown";
+}
 
 static int overlay_amf_is_supported_sw_format(enum AVPixelFormat fmt)
 {
@@ -63,6 +78,184 @@ static int overlay_amf_is_supported_sw_format(enum AVPixelFormat fmt)
         return 1;
     default:
         return 0;
+    }
+}
+
+static AVAMFDeviceContext *overlay_amf_get_device_ctx(AVHWFramesContext *frames_ctx)
+{
+    AVHWDeviceContext *device_ctx;
+
+    if (!frames_ctx || !frames_ctx->device_ref)
+        return NULL;
+
+    device_ctx = (AVHWDeviceContext *)frames_ctx->device_ref->data;
+    if (!device_ctx || device_ctx->type != AV_HWDEVICE_TYPE_AMF)
+        return NULL;
+
+    return device_ctx->hwctx;
+}
+
+static void overlay_amf_find_format_support(AMFIOCaps *caps,
+                                            enum AMF_SURFACE_FORMAT format,
+                                            OverlayAMFFormatSupport *support)
+{
+    int nb_formats;
+    int i;
+
+    if (!support)
+        return;
+
+    support->supported = 0;
+    support->native = 0;
+
+    if (!caps || format == AMF_SURFACE_UNKNOWN)
+        return;
+
+    nb_formats = caps->pVtbl->GetNumOfFormats(caps);
+    for (i = 0; i < nb_formats; i++) {
+        AMF_SURFACE_FORMAT candidate = AMF_SURFACE_UNKNOWN;
+        amf_bool native = 0;
+
+        if (caps->pVtbl->GetFormatAt(caps, i, &candidate, &native) != AMF_OK)
+            continue;
+        if (candidate != format)
+            continue;
+
+        support->supported = 1;
+        support->native = !!native;
+        return;
+    }
+}
+
+static int overlay_amf_query_converter_support(AVFilterContext *avctx,
+                                               AVAMFDeviceContext *device_ctx,
+                                               enum AMF_SURFACE_FORMAT input_format,
+                                               enum AMF_SURFACE_FORMAT output_format,
+                                               OverlayAMFFormatSupport *input_support,
+                                               OverlayAMFFormatSupport *output_support)
+{
+    AMFComponent *converter = NULL;
+    AMFCaps *caps = NULL;
+    AMFIOCaps *input_caps = NULL;
+    AMFIOCaps *output_caps = NULL;
+    AMF_RESULT res;
+    int err = 0;
+
+    if (input_support) {
+        input_support->supported = 0;
+        input_support->native = 0;
+    }
+    if (output_support) {
+        output_support->supported = 0;
+        output_support->native = 0;
+    }
+
+    if (!device_ctx || !device_ctx->factory || !device_ctx->context)
+        return AVERROR(EINVAL);
+
+    av_log(avctx, AV_LOG_VERBOSE,
+           "overlay_amf: probing AMF VideoConverter caps for %s -> %s\n",
+           overlay_amf_pix_fmt_name(av_amf_to_av_format(input_format)),
+           overlay_amf_pix_fmt_name(av_amf_to_av_format(output_format)));
+
+    res = device_ctx->factory->pVtbl->CreateComponent(device_ctx->factory,
+                                                      device_ctx->context,
+                                                      AMFVideoConverter,
+                                                      &converter);
+    if (res != AMF_OK || !converter) {
+        av_log(avctx, AV_LOG_VERBOSE,
+               "overlay_amf: CreateComponent(%ls) for caps probe failed with error %d\n",
+               AMFVideoConverter, res);
+        return AVERROR_EXTERNAL;
+    }
+
+    res = converter->pVtbl->GetCaps(converter, &caps);
+    if (res != AMF_OK || !caps) {
+        av_log(avctx, AV_LOG_VERBOSE,
+               "overlay_amf: AMF VideoConverter GetCaps() failed with error %d\n",
+               res);
+        err = AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+    res = caps->pVtbl->GetInputCaps(caps, &input_caps);
+    if (res != AMF_OK || !input_caps) {
+        av_log(avctx, AV_LOG_VERBOSE,
+               "overlay_amf: AMF VideoConverter GetInputCaps() failed with error %d\n",
+               res);
+        err = AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+    res = caps->pVtbl->GetOutputCaps(caps, &output_caps);
+    if (res != AMF_OK || !output_caps) {
+        av_log(avctx, AV_LOG_VERBOSE,
+               "overlay_amf: AMF VideoConverter GetOutputCaps() failed with error %d\n",
+               res);
+        err = AVERROR_EXTERNAL;
+        goto fail;
+    }
+
+    overlay_amf_find_format_support(input_caps, input_format, input_support);
+    overlay_amf_find_format_support(output_caps, output_format, output_support);
+
+fail:
+    if (output_caps)
+        output_caps->pVtbl->Release(output_caps);
+    if (input_caps)
+        input_caps->pVtbl->Release(input_caps);
+    if (caps)
+        caps->pVtbl->Release(caps);
+    if (converter)
+        converter->pVtbl->Release(converter);
+
+    return err;
+}
+
+static void overlay_amf_log_conversion_hint(AVFilterContext *avctx,
+                                            AVAMFDeviceContext *device_ctx,
+                                            enum AVPixelFormat src_fmt,
+                                            enum AVPixelFormat dst_fmt,
+                                            const char *label)
+{
+    OverlayAMFFormatSupport input_support;
+    OverlayAMFFormatSupport output_support;
+    enum AMF_SURFACE_FORMAT input_format = av_av_to_amf_format(src_fmt);
+    enum AMF_SURFACE_FORMAT output_format = av_av_to_amf_format(dst_fmt);
+    int ret;
+
+    if (src_fmt == dst_fmt)
+        return;
+
+    ret = overlay_amf_query_converter_support(avctx, device_ctx,
+                                              input_format, output_format,
+                                              &input_support, &output_support);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR,
+               "overlay_amf: %s input %s is not directly usable here; expected %s. "
+               "Unable to query AMF VideoConverter caps, but inserting vpp_amf=format=%s "
+               "before overlay_amf is the intended conversion path.\n",
+               label, overlay_amf_pix_fmt_name(src_fmt), overlay_amf_pix_fmt_name(dst_fmt),
+               overlay_amf_pix_fmt_name(dst_fmt));
+        return;
+    }
+
+    if (input_support.supported && output_support.supported) {
+        av_log(avctx, AV_LOG_ERROR,
+               "overlay_amf: %s input %s is not directly usable here; expected %s. "
+               "AMF VideoConverter caps advertise %s input support (native=%d) and "
+               "%s output support (native=%d). Insert vpp_amf=format=%s before overlay_amf.\n",
+               label, overlay_amf_pix_fmt_name(src_fmt), overlay_amf_pix_fmt_name(dst_fmt),
+               overlay_amf_pix_fmt_name(src_fmt), input_support.native,
+               overlay_amf_pix_fmt_name(dst_fmt), output_support.native,
+               overlay_amf_pix_fmt_name(dst_fmt));
+    } else {
+        av_log(avctx, AV_LOG_ERROR,
+               "overlay_amf: %s input %s is not directly usable here; expected %s. "
+               "AMF VideoConverter caps do not advertise the %s -> %s conversion on this "
+               "device/driver.\n",
+               label, overlay_amf_pix_fmt_name(src_fmt), overlay_amf_pix_fmt_name(dst_fmt),
+               overlay_amf_pix_fmt_name(src_fmt), overlay_amf_pix_fmt_name(dst_fmt));
     }
 }
 
@@ -140,6 +333,7 @@ static int overlay_amf_blend(FFFrameSync *fs)
                                      ctx->y_position,
                                      ctx->overlay_has_alpha,
                                      ctx->enable_alpha_blend,
+                                     ctx->async_submit,
                                      ctx->premultiplied_alpha,
                                      ctx->global_alpha);
     if (ret < 0)
@@ -174,7 +368,9 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     FilterLink *overlay_inl = ff_filter_link(overlay_inlink);
     AVHWFramesContext *main_fc;
     AVHWFramesContext *overlay_fc;
+    AVAMFDeviceContext *device_ctx;
     enum AVPixelFormat in_format;
+    enum AVPixelFormat preferred_sw_format;
     enum AMF_SURFACE_FORMAT overlay_surface_format;
     int ret;
 
@@ -185,13 +381,21 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
 
     main_fc = (AVHWFramesContext *)main_inl->hw_frames_ctx->data;
     overlay_fc = (AVHWFramesContext *)overlay_inl->hw_frames_ctx->data;
+    device_ctx = overlay_amf_get_device_ctx(main_fc);
+    preferred_sw_format = ctx->enable_alpha_blend ? AV_PIX_FMT_RGBA : AV_PIX_FMT_BGRA;
 
     if (!overlay_amf_is_supported_sw_format(main_fc->sw_format) ||
         !overlay_amf_is_supported_sw_format(overlay_fc->sw_format)) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf currently supports packed RGB AMF surfaces only; got %s and %s\n",
-               av_get_pix_fmt_name(main_fc->sw_format),
-               av_get_pix_fmt_name(overlay_fc->sw_format));
+               overlay_amf_pix_fmt_name(main_fc->sw_format),
+               overlay_amf_pix_fmt_name(overlay_fc->sw_format));
+        if (!overlay_amf_is_supported_sw_format(main_fc->sw_format))
+            overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
+                                            preferred_sw_format, "main");
+        if (!overlay_amf_is_supported_sw_format(overlay_fc->sw_format))
+            overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
+                                            preferred_sw_format, "overlay");
         return AVERROR(ENOSYS);
     }
 
@@ -200,8 +404,10 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     if (ctx->main_surface_format != overlay_surface_format) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf requires matching AMF surface formats; got %s and %s\n",
-               av_get_pix_fmt_name(main_fc->sw_format),
-               av_get_pix_fmt_name(overlay_fc->sw_format));
+               overlay_amf_pix_fmt_name(main_fc->sw_format),
+               overlay_amf_pix_fmt_name(overlay_fc->sw_format));
+        overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
+                                        main_fc->sw_format, "overlay");
         return AVERROR(EINVAL);
     }
 
@@ -210,8 +416,14 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
          overlay_fc->sw_format != AV_PIX_FMT_RGBA)) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf alpha_blend=1 currently requires RGBA AMF surfaces on both inputs; got %s and %s\n",
-               av_get_pix_fmt_name(main_fc->sw_format),
-               av_get_pix_fmt_name(overlay_fc->sw_format));
+               overlay_amf_pix_fmt_name(main_fc->sw_format),
+               overlay_amf_pix_fmt_name(overlay_fc->sw_format));
+        if (main_fc->sw_format != AV_PIX_FMT_RGBA)
+            overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
+                                            AV_PIX_FMT_RGBA, "main");
+        if (overlay_fc->sw_format != AV_PIX_FMT_RGBA)
+            overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
+                                            AV_PIX_FMT_RGBA, "overlay");
         return AVERROR(ENOSYS);
     }
 
@@ -232,6 +444,11 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
         break;
     }
     ctx->common.reset_sar = 0;
+
+    av_log(avctx, AV_LOG_VERBOSE,
+           "overlay_amf: using %s AMF surfaces directly; no vpp_amf pre-conversion required%s\n",
+           overlay_amf_pix_fmt_name(main_fc->sw_format),
+           ctx->enable_alpha_blend ? " for alpha_blend=1" : "");
 
     ret = amf_init_filter_config(outlink, &in_format);
     if (ret < 0)
@@ -278,6 +495,7 @@ static const AVOption overlay_amf_options[] = {
     { "x", "Overlay x position", OFFSET(x_position), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, FLAGS },
     { "y", "Overlay y position", OFFSET(y_position), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, FLAGS },
     { "alpha_blend", "Blend overlay alpha instead of copying it opaquely", OFFSET(enable_alpha_blend), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "async_submit", "Submit alpha_blend Vulkan work asynchronously when AMF Vulkan sync is available", OFFSET(async_submit), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { "premultiplied", "Treat overlay alpha as premultiplied when alpha_blend=1", OFFSET(premultiplied_alpha), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { "global_alpha", "Scale overlay alpha when alpha_blend=1", OFFSET(global_alpha), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0.0, 1.0, FLAGS },
     { "eof_action", "Action to take when encountering EOF from secondary input ",
