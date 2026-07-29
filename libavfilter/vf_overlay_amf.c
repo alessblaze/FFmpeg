@@ -48,6 +48,8 @@ typedef struct OverlayAMFContext {
     int y_position;
     int overlay_has_alpha;
     int enable_alpha_blend;
+    int premultiplied_alpha;
+    float global_alpha;
     enum AMF_SURFACE_FORMAT main_surface_format;
 } OverlayAMFContext;
 
@@ -137,7 +139,9 @@ static int overlay_amf_blend(FFFrameSync *fs)
                                      ctx->x_position,
                                      ctx->y_position,
                                      ctx->overlay_has_alpha,
-                                     ctx->enable_alpha_blend);
+                                     ctx->enable_alpha_blend,
+                                     ctx->premultiplied_alpha,
+                                     ctx->global_alpha);
     if (ret < 0)
         goto fail;
 
@@ -274,6 +278,8 @@ static const AVOption overlay_amf_options[] = {
     { "x", "Overlay x position", OFFSET(x_position), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, FLAGS },
     { "y", "Overlay y position", OFFSET(y_position), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, FLAGS },
     { "alpha_blend", "Blend overlay alpha instead of copying it opaquely", OFFSET(enable_alpha_blend), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "premultiplied", "Treat overlay alpha as premultiplied when alpha_blend=1", OFFSET(premultiplied_alpha), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "global_alpha", "Scale overlay alpha when alpha_blend=1", OFFSET(global_alpha), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0.0, 1.0, FLAGS },
     { "eof_action", "Action to take when encountering EOF from secondary input ",
         OFFSET(fs.opt_eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_REPEAT },
         EOF_ACTION_REPEAT, EOF_ACTION_PASS, .flags = FLAGS, .unit = "eof_action" },

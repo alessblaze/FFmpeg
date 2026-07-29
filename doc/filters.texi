@@ -26117,6 +26117,14 @@ If @code{alpha_blend=0}, the overlay is copied opaquely and packed RGB AMF
 formats such as @code{BGRA}, @code{RGBA}, @code{BGR0}, and @code{RGB0} are
 accepted as long as both inputs match.
 
+@item premultiplied
+If set to 1 together with @code{alpha_blend=1}, treat the overlay as
+premultiplied alpha before blending. Default is 0.
+
+@item global_alpha
+Scale the overlay alpha when @code{alpha_blend=1}. Range is from 0.0 to 1.0.
+Default is 1.0.
+
 @item eof_action
 @item shortest
 @item repeatlast
@@ -26145,6 +26153,30 @@ ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
     -filter_complex "[0:v]vpp_amf=format=rgba[main]; \
                      [1:v]scale=320:-1,format=rgba,hwupload[ov]; \
                      [main][ov]overlay_amf=x=64:y=64:alpha_blend=1, \
+                     vpp_amf=format=p010[out]" \
+    -map "[out]" -c:v hevc_amf output.ts
+@end example
+
+@item
+Premultiplied-alpha overlay on the fast Vulkan compute path:
+@example
+ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
+    -c:v hevc_amf -i input.ts -loop 1 -i logo.png \
+    -filter_complex "[0:v]vpp_amf=format=rgba[main]; \
+                     [1:v]scale=320:-1,format=rgba,hwupload[ov]; \
+                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1:premultiplied=1, \
+                     vpp_amf=format=p010[out]" \
+    -map "[out]" -c:v hevc_amf output.ts
+@end example
+
+@item
+Premultiplied-alpha overlay with additional global alpha scaling:
+@example
+ffmpeg -init_hw_device amf=amf -filter_hw_device amf \
+    -c:v hevc_amf -i input.ts -loop 1 -i logo.png \
+    -filter_complex "[0:v]vpp_amf=format=rgba[main]; \
+                     [1:v]scale=320:-1,format=rgba,hwupload[ov]; \
+                     [main][ov]overlay_amf=x=64:y=64:alpha_blend=1:premultiplied=1:global_alpha=0.75, \
                      vpp_amf=format=p010[out]" \
     -map "[out]" -c:v hevc_amf output.ts
 @end example

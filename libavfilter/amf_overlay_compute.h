@@ -29,7 +29,9 @@ int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
                                int x_position,
                                int y_position,
                                int overlay_has_alpha,
-                               int enable_alpha_blend);
+                               int enable_alpha_blend,
+                               int premultiplied_alpha,
+                               float global_alpha);
 
 #ifdef __cplusplus
 }

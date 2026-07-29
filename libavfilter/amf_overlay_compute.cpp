@@ -54,6 +54,8 @@ typedef struct OverlayAlphaPushConstants {
     int32_t src_origin[2];
     int32_t src_size[2];
     int32_t overlay_size[2];
+    int32_t premultiplied_alpha;
+    float global_alpha;
 } OverlayAlphaPushConstants;
 
 struct AVAMFDeviceContext {
@@ -553,7 +555,9 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
                                amf::AMFVulkanView *overlay_view,
                                const VkOffset3D *src_offset,
                                const VkOffset3D *dst_offset,
-                               const VkExtent3D *extent)
+                               const VkExtent3D *extent,
+                               int premultiplied_alpha,
+                               float global_alpha)
 {
     VkCommandBufferBeginInfo begin_info = {};
     VkDescriptorImageInfo image_infos[2] = {};
@@ -623,6 +627,8 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
     push.src_size[1] = (int32_t)extent->height;
     push.overlay_size[0] = overlay_view->iPlaneWidth;
     push.overlay_size[1] = overlay_view->iPlaneHeight;
+    push.premultiplied_alpha = premultiplied_alpha;
+    push.global_alpha = global_alpha;
 
     group_count_x = (extent->width + 7) / 8;
     group_count_y = (extent->height + 7) / 8;
@@ -791,7 +797,9 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
                                           int x_position,
                                           int y_position,
                                           int overlay_has_alpha,
-                                          int enable_alpha_blend)
+                                          int enable_alpha_blend,
+                                          int premultiplied_alpha,
+                                          float global_alpha)
 {
     amf::AMFVulkanView *main_view = nullptr;
     amf::AMFVulkanView *overlay_view = nullptr;
@@ -864,11 +872,12 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
 
     if (overlay_has_alpha && enable_alpha_blend) {
         av_log(ctx->log_ctx, AV_LOG_VERBOSE,
-               "overlay_amf: Vulkan compute alpha blend dst=(%d,%d) src=(%d,%d) size=%ux%u\n",
+               "overlay_amf: Vulkan compute alpha blend dst=(%d,%d) src=(%d,%d) size=%ux%u premultiplied=%d global_alpha=%g\n",
                dst_offset.x, dst_offset.y, src_offset.x, src_offset.y,
-               extent.width, extent.height);
+               extent.width, extent.height, premultiplied_alpha, global_alpha);
         err = execute_alpha_blend(ctx, main_view, overlay_view,
-                                  &src_offset, &dst_offset, &extent);
+                                  &src_offset, &dst_offset, &extent,
+                                  premultiplied_alpha, global_alpha);
         if (err < 0)
             goto fail;
     } else {
