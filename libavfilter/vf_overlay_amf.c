@@ -107,17 +107,42 @@ static int overlay_amf_resolve_premultiplied_alpha(AVFilterContext *avctx,
     return 0;
 }
 
-static int overlay_amf_is_supported_sw_format(enum AVPixelFormat fmt)
+static int overlay_amf_is_supported_packed_rgb_format(enum AVPixelFormat fmt)
 {
     switch (fmt) {
     case AV_PIX_FMT_BGRA:
     case AV_PIX_FMT_RGBA:
     case AV_PIX_FMT_BGR0:
-    case AV_PIX_FMT_RGB0:
     case AV_PIX_FMT_RGBAF16:
         return 1;
     default:
         return 0;
+    }
+}
+
+static int overlay_amf_is_supported_opaque_format(enum AVPixelFormat fmt)
+{
+    switch (fmt) {
+    case AV_PIX_FMT_BGRA:
+    case AV_PIX_FMT_RGBA:
+    case AV_PIX_FMT_BGR0:
+    case AV_PIX_FMT_RGBAF16:
+    case AV_PIX_FMT_NV12:
+    case AV_PIX_FMT_YUV420P:
+    case AV_PIX_FMT_P010:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static enum AVPixelFormat overlay_amf_output_sw_format(enum AVPixelFormat fmt)
+{
+    switch (fmt) {
+    case AV_PIX_FMT_BGR0:
+        return AV_PIX_FMT_BGRA;
+    default:
+        return fmt;
     }
 }
 
@@ -422,9 +447,10 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     AVHWFramesContext *overlay_fc;
     AVAMFDeviceContext *device_ctx;
     enum AVPixelFormat in_format;
-    enum AVPixelFormat preferred_sw_format;
     int main_is_packed_rgb;
     int overlay_is_packed_rgb;
+    int main_is_opaque_format;
+    int overlay_is_opaque_format;
     int ret;
 
     if (!main_inl->hw_frames_ctx || !overlay_inl->hw_frames_ctx) {
@@ -435,30 +461,45 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     main_fc = (AVHWFramesContext *)main_inl->hw_frames_ctx->data;
     overlay_fc = (AVHWFramesContext *)overlay_inl->hw_frames_ctx->data;
     device_ctx = overlay_amf_get_device_ctx(main_fc);
-    preferred_sw_format = ctx->enable_alpha_blend ? AV_PIX_FMT_RGBA : AV_PIX_FMT_BGRA;
-    main_is_packed_rgb = overlay_amf_is_supported_sw_format(main_fc->sw_format);
-    overlay_is_packed_rgb = overlay_amf_is_supported_sw_format(overlay_fc->sw_format);
+    main_is_packed_rgb = overlay_amf_is_supported_packed_rgb_format(main_fc->sw_format);
+    overlay_is_packed_rgb = overlay_amf_is_supported_packed_rgb_format(overlay_fc->sw_format);
+    main_is_opaque_format = overlay_amf_is_supported_opaque_format(main_fc->sw_format);
+    overlay_is_opaque_format = overlay_amf_is_supported_opaque_format(overlay_fc->sw_format);
 
-    if (!main_is_packed_rgb ||
-        !overlay_is_packed_rgb) {
-        av_log(avctx, AV_LOG_ERROR,
-               "overlay_amf currently supports packed RGB AMF surfaces on both inputs; got %s and %s\n",
-               overlay_amf_pix_fmt_name(main_fc->sw_format),
-               overlay_amf_pix_fmt_name(overlay_fc->sw_format));
-        if (!main_is_packed_rgb)
-            overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
-                                            preferred_sw_format, "main");
-        if (!overlay_is_packed_rgb)
-            overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
-                                            preferred_sw_format, "overlay");
-        return AVERROR(ENOSYS);
+    if (ctx->enable_alpha_blend) {
+        if (!main_is_packed_rgb || !overlay_is_packed_rgb) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "overlay_amf alpha_blend=1 requires packed RGB AMF surfaces on both inputs; got %s and %s\n",
+                   overlay_amf_pix_fmt_name(main_fc->sw_format),
+                   overlay_amf_pix_fmt_name(overlay_fc->sw_format));
+            if (!main_is_packed_rgb)
+                overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
+                                                AV_PIX_FMT_RGBA, "main");
+            if (!overlay_is_packed_rgb)
+                overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
+                                                AV_PIX_FMT_RGBA, "overlay");
+            return AVERROR(ENOSYS);
+        }
+    } else {
+        if (!main_is_opaque_format || !overlay_is_opaque_format) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "overlay_amf opaque copy currently supports matching AMF surface formats among packed RGB, nv12, yuv420p, and p010; got %s and %s\n",
+                   overlay_amf_pix_fmt_name(main_fc->sw_format),
+                   overlay_amf_pix_fmt_name(overlay_fc->sw_format));
+            if (!main_is_opaque_format)
+                overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
+                                                AV_PIX_FMT_BGRA, "main");
+            if (!overlay_is_opaque_format)
+                overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
+                                                overlay_amf_output_sw_format(main_fc->sw_format), "overlay");
+            return AVERROR(ENOSYS);
+        }
     }
 
     ctx->main_surface_format = av_av_to_amf_format(main_fc->sw_format);
     ctx->overlay_has_alpha = overlay_amf_sw_format_has_alpha(overlay_fc->sw_format);
 
-    if (main_is_packed_rgb && !ctx->enable_alpha_blend &&
-        ctx->main_surface_format != av_av_to_amf_format(overlay_fc->sw_format)) {
+    if (ctx->main_surface_format != av_av_to_amf_format(overlay_fc->sw_format)) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf requires matching AMF surface formats; got %s and %s\n",
                overlay_amf_pix_fmt_name(main_fc->sw_format),
@@ -468,7 +509,7 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
-    if (main_is_packed_rgb && ctx->enable_alpha_blend &&
+    if (ctx->enable_alpha_blend &&
         !ctx->overlay_has_alpha) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf alpha_blend=1 requires an alpha-bearing packed RGB overlay surface; got %s over %s\n",
@@ -481,34 +522,13 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
 
     ctx->common.width = main_inlink->w;
     ctx->common.height = main_inlink->h;
-    switch (ctx->main_surface_format) {
-    case AMF_SURFACE_BGRA:
-        ctx->common.format = AV_PIX_FMT_BGRA;
-        break;
-    case AMF_SURFACE_RGBA:
-        ctx->common.format = AV_PIX_FMT_RGBA;
-        break;
-    case AMF_SURFACE_ARGB:
-        ctx->common.format = AV_PIX_FMT_BGRA;
-        break;
-    case AMF_SURFACE_RGBA_F16:
-        ctx->common.format = AV_PIX_FMT_RGBAF16;
-        break;
-    default:
-        if (main_fc->sw_format == AV_PIX_FMT_BGR0)
-            ctx->common.format = AV_PIX_FMT_BGRA;
-        else if (main_fc->sw_format == AV_PIX_FMT_RGB0)
-            ctx->common.format = AV_PIX_FMT_RGBA;
-        else
-            ctx->common.format = AV_PIX_FMT_NONE;
-        break;
-    }
+    ctx->common.format = overlay_amf_output_sw_format(main_fc->sw_format);
     ctx->common.reset_sar = 0;
 
     av_log(avctx, AV_LOG_VERBOSE,
-           "overlay_amf: using %s AMF surfaces directly; no vpp_amf pre-conversion required%s\n",
+           "overlay_amf: using %s AMF surfaces directly on the %s path; no vpp_amf pre-conversion required\n",
            overlay_amf_pix_fmt_name(main_fc->sw_format),
-           ctx->enable_alpha_blend ? " for alpha_blend=1" : "");
+           ctx->enable_alpha_blend ? "alpha blend" : "native opaque copy");
 
     ret = amf_init_filter_config(outlink, &in_format);
     if (ret < 0)

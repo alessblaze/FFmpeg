@@ -23,7 +23,9 @@ extern "C" {
 #include <vector>
 
 static const unsigned OVERLAY_AMF_MAX_ASYNC_JOBS = 4;
-static const unsigned OVERLAY_AMF_MAX_SYNC_RESOURCES = 4;
+static const unsigned OVERLAY_AMF_MAX_SYNC_RESOURCES = 8;
+static const unsigned OVERLAY_AMF_MAX_COPY_PLANES = 4;
+static const unsigned OVERLAY_AMF_MAX_COPY_SURFACES = 4;
 
 typedef struct OverlayAlphaPushConstants {
     int32_t dst_origin[2];
@@ -54,6 +56,21 @@ typedef struct OverlayPendingSync {
     uint64_t signal_value;
     int signaled;
 } OverlayPendingSync;
+
+typedef struct OverlayCopyPlane {
+    amf::AMFVulkanView *main_view;
+    amf::AMFVulkanView *overlay_view;
+    VkImageAspectFlags aspect_mask;
+    VkOffset3D src_offset;
+    VkOffset3D dst_offset;
+    VkExtent3D extent;
+} OverlayCopyPlane;
+
+typedef struct OverlayCopySurface {
+    amf::AMFVulkanSurface *surface;
+    VkImageAspectFlags aspect_mask;
+    VkImageLayout old_layout;
+} OverlayCopySurface;
 
 struct FFAMFOverlayComputeContext {
     amf::AMFContext *context;
@@ -328,6 +345,110 @@ static amf::AMFVulkanView *get_packed_vulkan_view(amf::AMFSurface *surface, void
     return get_plane_vulkan_view(surface, amf::AMF_PLANE_PACKED, "packed", log_ctx);
 }
 
+static int floor_rshift_int(int value, unsigned shift)
+{
+    if (!shift)
+        return value;
+    if (value >= 0)
+        return value >> shift;
+    return -(((-value) + (1 << shift) - 1) >> shift);
+}
+
+static int get_copy_layout_from_surface_format(amf::AMF_SURFACE_FORMAT format,
+                                               amf::AMF_PLANE_TYPE plane_types[OVERLAY_AMF_MAX_COPY_PLANES],
+                                               VkImageAspectFlags plane_aspects[OVERLAY_AMF_MAX_COPY_PLANES],
+                                               unsigned plane_shifts_x[OVERLAY_AMF_MAX_COPY_PLANES],
+                                               unsigned plane_shifts_y[OVERLAY_AMF_MAX_COPY_PLANES],
+                                               unsigned *nb_planes)
+{
+    switch (format) {
+    case amf::AMF_SURFACE_BGRA:
+    case amf::AMF_SURFACE_RGBA:
+    case amf::AMF_SURFACE_ARGB:
+    case amf::AMF_SURFACE_R10G10B10A2:
+    case amf::AMF_SURFACE_RGBA_F16:
+    case amf::AMF_SURFACE_YUY2:
+        plane_types[0] = amf::AMF_PLANE_PACKED;
+        plane_aspects[0] = VK_IMAGE_ASPECT_COLOR_BIT;
+        plane_shifts_x[0] = 0;
+        plane_shifts_y[0] = 0;
+        *nb_planes = 1;
+        return 0;
+    case amf::AMF_SURFACE_NV12:
+    case amf::AMF_SURFACE_P010:
+        plane_types[0] = amf::AMF_PLANE_Y;
+        plane_types[1] = amf::AMF_PLANE_UV;
+        plane_aspects[0] = VK_IMAGE_ASPECT_PLANE_0_BIT;
+        plane_aspects[1] = VK_IMAGE_ASPECT_PLANE_1_BIT;
+        plane_shifts_x[0] = plane_shifts_y[0] = 0;
+        plane_shifts_x[1] = plane_shifts_y[1] = 1;
+        *nb_planes = 2;
+        return 0;
+    case amf::AMF_SURFACE_YUV420P:
+        plane_types[0] = amf::AMF_PLANE_Y;
+        plane_types[1] = amf::AMF_PLANE_U;
+        plane_types[2] = amf::AMF_PLANE_V;
+        plane_aspects[0] = VK_IMAGE_ASPECT_PLANE_0_BIT;
+        plane_aspects[1] = VK_IMAGE_ASPECT_PLANE_1_BIT;
+        plane_aspects[2] = VK_IMAGE_ASPECT_PLANE_2_BIT;
+        plane_shifts_x[0] = plane_shifts_y[0] = 0;
+        plane_shifts_x[1] = plane_shifts_y[1] = 1;
+        plane_shifts_x[2] = plane_shifts_y[2] = 1;
+        *nb_planes = 3;
+        return 0;
+    default:
+        *nb_planes = 0;
+        return AVERROR(ENOSYS);
+    }
+}
+
+static VkImageAspectFlags resolve_copy_aspect(const amf::AMFVulkanSurface *surface,
+                                              VkImageAspectFlags requested_aspect)
+{
+    VkFormat format;
+
+    if (!surface)
+        return requested_aspect;
+
+    if (requested_aspect == VK_IMAGE_ASPECT_COLOR_BIT)
+        return requested_aspect;
+
+    format = static_cast<VkFormat>(surface->eFormat);
+    switch (format) {
+    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+    case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
+    case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
+    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
+    case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
+        return requested_aspect;
+    default:
+        return VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+}
+
+static int append_copy_surface(OverlayCopySurface surfaces[OVERLAY_AMF_MAX_COPY_SURFACES],
+                               unsigned *nb_surfaces,
+                               amf::AMFVulkanSurface *surface,
+                               VkImageAspectFlags aspect_mask)
+{
+    for (unsigned i = 0; i < *nb_surfaces; i++) {
+        if (surfaces[i].surface == surface) {
+            surfaces[i].aspect_mask |= aspect_mask;
+            return 0;
+        }
+    }
+
+    if (*nb_surfaces >= OVERLAY_AMF_MAX_COPY_SURFACES)
+        return AVERROR(EINVAL);
+
+    surfaces[*nb_surfaces].surface = surface;
+    surfaces[*nb_surfaces].aspect_mask = aspect_mask;
+    surfaces[*nb_surfaces].old_layout = static_cast<VkImageLayout>(surface->eCurrentLayout);
+    (*nb_surfaces)++;
+    return 0;
+}
+
 static int get_compute_queue_index(FFAMFOverlayComputeContext *ctx, uint32_t *queue_index)
 {
     amf_int64 queue_index64 = 0;
@@ -378,58 +499,6 @@ static uint32_t find_queue_family_index(const amf::AMFVulkanDevice *device, VkQu
     }
 
     return UINT32_MAX;
-}
-
-static void transition_surface(VkCommandBuffer cmd, amf::AMFVulkanSurface *surface,
-                               VkImageLayout new_layout,
-                               VkAccessFlags dst_access,
-                               VkPipelineStageFlags dst_stage)
-{
-    if ((VkImageLayout)surface->eCurrentLayout == new_layout)
-        return;
-
-    VkImageMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = static_cast<VkImageLayout>(surface->eCurrentLayout);
-    barrier.newLayout = new_layout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = surface->hImage;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-
-    switch (barrier.oldLayout) {
-    case VK_IMAGE_LAYOUT_UNDEFINED:
-        barrier.srcAccessMask = 0;
-        break;
-    case VK_IMAGE_LAYOUT_PREINITIALIZED:
-        barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        break;
-    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        break;
-    default:
-        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        break;
-    }
-
-    barrier.dstAccessMask = dst_access;
-
-    vkCmdPipelineBarrier(cmd,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         dst_stage,
-                         0,
-                         0, nullptr,
-                         0, nullptr,
-                         1, &barrier);
-
-    surface->eCurrentLayout = new_layout;
 }
 
 static void insert_memory_visibility_barrier(VkCommandBuffer cmd,
@@ -822,6 +891,12 @@ static int collect_surface_sync(FFAMFOverlayComputeContext *ctx,
     return 0;
 }
 
+static void transition_surface(VkCommandBuffer cmd, amf::AMFVulkanSurface *surface,
+                               VkImageAspectFlags aspect_mask,
+                               VkImageLayout new_layout,
+                               VkAccessFlags dst_access,
+                               VkPipelineStageFlags dst_stage);
+
 static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
                                amf::AMFVulkanView *main_view,
                                amf::AMFVulkanView *overlay_view,
@@ -902,10 +977,12 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
     overlay_old_layout = (VkImageLayout)overlay_view->pSurface->eCurrentLayout;
 
     transition_surface(job->command_buffer, main_view->pSurface,
+                       VK_IMAGE_ASPECT_COLOR_BIT,
                        VK_IMAGE_LAYOUT_GENERAL,
                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     transition_surface(job->command_buffer, overlay_view->pSurface,
+                       VK_IMAGE_ASPECT_COLOR_BIT,
                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                        VK_ACCESS_SHADER_READ_BIT,
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -969,10 +1046,12 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
     transition_surface(job->command_buffer, main_view->pSurface,
+                       VK_IMAGE_ASPECT_COLOR_BIT,
                        main_old_layout,
                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
     transition_surface(job->command_buffer, overlay_view->pSurface,
+                       VK_IMAGE_ASPECT_COLOR_BIT,
                        overlay_old_layout,
                        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -1029,17 +1108,69 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
     return 0;
 }
 
+static void transition_surface(VkCommandBuffer cmd, amf::AMFVulkanSurface *surface,
+                               VkImageAspectFlags aspect_mask,
+                               VkImageLayout new_layout,
+                               VkAccessFlags dst_access,
+                               VkPipelineStageFlags dst_stage)
+{
+    if ((VkImageLayout)surface->eCurrentLayout == new_layout)
+        return;
+
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = static_cast<VkImageLayout>(surface->eCurrentLayout);
+    barrier.newLayout = new_layout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = surface->hImage;
+    barrier.subresourceRange.aspectMask = aspect_mask;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    switch (barrier.oldLayout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        barrier.srcAccessMask = 0;
+        break;
+    case VK_IMAGE_LAYOUT_PREINITIALIZED:
+        barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    default:
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        break;
+    }
+
+    barrier.dstAccessMask = dst_access;
+
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         dst_stage,
+                         0,
+                         0, nullptr,
+                         0, nullptr,
+                         1, &barrier);
+
+    surface->eCurrentLayout = new_layout;
+}
+
 static int execute_opaque_copy(FFAMFOverlayComputeContext *ctx,
-                               amf::AMFVulkanView *main_view,
-                               amf::AMFVulkanView *overlay_view,
+                               const OverlayCopyPlane *planes,
+                               unsigned nb_planes,
                                amf::AMFSurface *main_surface,
-                               amf::AMFSurface *overlay_surface,
-                               const VkOffset3D *src_offset,
-                               const VkOffset3D *dst_offset,
-                               const VkExtent3D *extent)
+                               amf::AMFSurface *overlay_surface)
 {
     OverlayAlphaJob *job;
     OverlayPendingSync pending_syncs[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
+    OverlayCopySurface main_surfaces[OVERLAY_AMF_MAX_COPY_SURFACES] = {};
+    OverlayCopySurface overlay_surfaces[OVERLAY_AMF_MAX_COPY_SURFACES] = {};
     VkCommandBufferBeginInfo begin_info = {};
     VkSubmitInfo submit = {};
     VkTimelineSemaphoreSubmitInfo timeline_submit = {};
@@ -1048,13 +1179,29 @@ static int execute_opaque_copy(FFAMFOverlayComputeContext *ctx,
     uint64_t wait_values[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
     VkSemaphore signal_semaphores[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
     uint64_t signal_values[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
-    VkImageCopy copy_region = {};
-    VkImageLayout main_old_layout;
-    VkImageLayout overlay_old_layout;
+    unsigned nb_main_surfaces = 0;
+    unsigned nb_overlay_surfaces = 0;
+    unsigned pending_count = 0;
     uint32_t wait_count = 0;
     uint32_t signal_count = 0;
     VkResult res;
     int err;
+
+    if (!nb_planes)
+        return 0;
+
+    for (unsigned i = 0; i < nb_planes; i++) {
+        err = append_copy_surface(main_surfaces, &nb_main_surfaces,
+                                  planes[i].main_view->pSurface,
+                                  planes[i].aspect_mask);
+        if (err < 0)
+            return err;
+        err = append_copy_surface(overlay_surfaces, &nb_overlay_surfaces,
+                                  planes[i].overlay_view->pSurface,
+                                  planes[i].aspect_mask);
+        if (err < 0)
+            return err;
+    }
 
     job = select_alpha_job(ctx, 0);
     if (!job)
@@ -1066,18 +1213,26 @@ static int execute_opaque_copy(FFAMFOverlayComputeContext *ctx,
             return err;
     }
 
-    err = collect_surface_sync(ctx, &main_view->pSurface->Sync, &pending_syncs[0],
-                               VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               wait_semaphores, wait_stages, wait_values, &wait_count,
-                               signal_semaphores, signal_values, &signal_count);
-    if (err < 0)
-        return err;
-    err = collect_surface_sync(ctx, &overlay_view->pSurface->Sync, &pending_syncs[1],
-                               VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               wait_semaphores, wait_stages, wait_values, &wait_count,
-                               signal_semaphores, signal_values, &signal_count);
-    if (err < 0)
-        return err;
+    for (unsigned i = 0; i < nb_main_surfaces; i++) {
+        if (pending_count >= OVERLAY_AMF_MAX_SYNC_RESOURCES)
+            return AVERROR(EINVAL);
+        err = collect_surface_sync(ctx, &main_surfaces[i].surface->Sync, &pending_syncs[pending_count++],
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   wait_semaphores, wait_stages, wait_values, &wait_count,
+                                   signal_semaphores, signal_values, &signal_count);
+        if (err < 0)
+            return err;
+    }
+    for (unsigned i = 0; i < nb_overlay_surfaces; i++) {
+        if (pending_count >= OVERLAY_AMF_MAX_SYNC_RESOURCES)
+            return AVERROR(EINVAL);
+        err = collect_surface_sync(ctx, &overlay_surfaces[i].surface->Sync, &pending_syncs[pending_count++],
+                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   wait_semaphores, wait_stages, wait_values, &wait_count,
+                                   signal_semaphores, signal_values, &signal_count);
+        if (err < 0)
+            return err;
+    }
 
     res = vkResetFences(ctx->device->hDevice, 1, &job->fence);
     if (res != VK_SUCCESS)
@@ -1094,34 +1249,41 @@ static int execute_opaque_copy(FFAMFOverlayComputeContext *ctx,
     if (res != VK_SUCCESS)
         return vk_result_to_averror(ctx->log_ctx, "vkBeginCommandBuffer", res);
 
-    main_old_layout = (VkImageLayout)main_view->pSurface->eCurrentLayout;
-    overlay_old_layout = (VkImageLayout)overlay_view->pSurface->eCurrentLayout;
+    for (unsigned i = 0; i < nb_main_surfaces; i++) {
+        transition_surface(job->command_buffer, main_surfaces[i].surface,
+                           main_surfaces[i].aspect_mask,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
+    for (unsigned i = 0; i < nb_overlay_surfaces; i++) {
+        transition_surface(job->command_buffer, overlay_surfaces[i].surface,
+                           overlay_surfaces[i].aspect_mask,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_ACCESS_TRANSFER_READ_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
 
-    transition_surface(job->command_buffer, main_view->pSurface,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                       VK_ACCESS_TRANSFER_WRITE_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT);
-    transition_surface(job->command_buffer, overlay_view->pSurface,
-                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       VK_ACCESS_TRANSFER_READ_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+    for (unsigned i = 0; i < nb_planes; i++) {
+        VkImageCopy copy_region = {};
 
-    copy_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy_region.srcSubresource.mipLevel = 0;
-    copy_region.srcSubresource.baseArrayLayer = 0;
-    copy_region.srcSubresource.layerCount = 1;
-    copy_region.srcOffset = *src_offset;
-    copy_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy_region.dstSubresource.mipLevel = 0;
-    copy_region.dstSubresource.baseArrayLayer = 0;
-    copy_region.dstSubresource.layerCount = 1;
-    copy_region.dstOffset = *dst_offset;
-    copy_region.extent = *extent;
+        copy_region.srcSubresource.aspectMask = planes[i].aspect_mask;
+        copy_region.srcSubresource.mipLevel = 0;
+        copy_region.srcSubresource.baseArrayLayer = 0;
+        copy_region.srcSubresource.layerCount = 1;
+        copy_region.srcOffset = planes[i].src_offset;
+        copy_region.dstSubresource.aspectMask = planes[i].aspect_mask;
+        copy_region.dstSubresource.mipLevel = 0;
+        copy_region.dstSubresource.baseArrayLayer = 0;
+        copy_region.dstSubresource.layerCount = 1;
+        copy_region.dstOffset = planes[i].dst_offset;
+        copy_region.extent = planes[i].extent;
 
-    vkCmdCopyImage(job->command_buffer,
-                   overlay_view->pSurface->hImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                   main_view->pSurface->hImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                   1, &copy_region);
+        vkCmdCopyImage(job->command_buffer,
+                       planes[i].overlay_view->pSurface->hImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       planes[i].main_view->pSurface->hImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &copy_region);
+    }
 
     insert_memory_visibility_barrier(job->command_buffer,
                                      VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1129,14 +1291,20 @@ static int execute_opaque_copy(FFAMFOverlayComputeContext *ctx,
                                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
-    transition_surface(job->command_buffer, main_view->pSurface,
-                       main_old_layout,
-                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-    transition_surface(job->command_buffer, overlay_view->pSurface,
-                       overlay_old_layout,
-                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    for (unsigned i = 0; i < nb_main_surfaces; i++) {
+        transition_surface(job->command_buffer, main_surfaces[i].surface,
+                           main_surfaces[i].aspect_mask,
+                           main_surfaces[i].old_layout,
+                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
+    for (unsigned i = 0; i < nb_overlay_surfaces; i++) {
+        transition_surface(job->command_buffer, overlay_surfaces[i].surface,
+                           overlay_surfaces[i].aspect_mask,
+                           overlay_surfaces[i].old_layout,
+                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
 
     res = vkEndCommandBuffer(job->command_buffer);
     if (res != VK_SUCCESS)
@@ -1316,8 +1484,13 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
 {
     amf::AMFVulkanView *main_view = nullptr;
     amf::AMFVulkanView *overlay_view = nullptr;
-    amf::AMFPlane *main_plane = nullptr;
-    amf::AMFPlane *overlay_plane = nullptr;
+    amf::AMF_PLANE_TYPE plane_types[OVERLAY_AMF_MAX_COPY_PLANES] = {};
+    VkImageAspectFlags plane_aspects[OVERLAY_AMF_MAX_COPY_PLANES] = {};
+    unsigned plane_shifts_x[OVERLAY_AMF_MAX_COPY_PLANES] = {};
+    unsigned plane_shifts_y[OVERLAY_AMF_MAX_COPY_PLANES] = {};
+    OverlayCopyPlane copy_planes[OVERLAY_AMF_MAX_COPY_PLANES] = {};
+    unsigned nb_copy_planes = 0;
+    unsigned nb_valid_copy_planes = 0;
     VkOffset3D src_offset = {};
     VkOffset3D dst_offset = {};
     VkExtent3D extent = {};
@@ -1344,15 +1517,6 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
         if (ctx->unlock)
             ctx->unlock(ctx->lock_ctx);
         return 0;
-    }
-
-    main_plane = main_surface->GetPlane(amf::AMF_PLANE_PACKED);
-    overlay_plane = overlay_surface->GetPlane(amf::AMF_PLANE_PACKED);
-    if (!main_plane || !overlay_plane) {
-        av_log(ctx->log_ctx, AV_LOG_ERROR,
-               "overlay_amf: missing packed RGB plane on one of the AMF surfaces\n");
-        err = AVERROR(EINVAL);
-        goto fail;
     }
 
     if (overlay_has_alpha && enable_alpha_blend) {
@@ -1393,11 +1557,61 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
         if (err < 0)
             goto fail;
     } else {
-        main_view = get_packed_vulkan_view(main_surface, ctx->log_ctx);
-        overlay_view = get_packed_vulkan_view(overlay_surface, ctx->log_ctx);
-        if (!main_view || !overlay_view) {
-            err = AVERROR_EXTERNAL;
+        err = get_copy_layout_from_surface_format(main_surface->GetFormat(),
+                                                  plane_types, plane_aspects,
+                                                  plane_shifts_x, plane_shifts_y,
+                                                  &nb_copy_planes);
+        if (err < 0) {
+            av_log(ctx->log_ctx, AV_LOG_ERROR,
+                   "overlay_amf: native opaque copy is not implemented for AMF surface format %d\n",
+                   (int)main_surface->GetFormat());
             goto fail;
+        }
+
+        for (unsigned i = 0; i < nb_copy_planes; i++) {
+            int plane_x = floor_rshift_int(x_position, plane_shifts_x[i]);
+            int plane_y = floor_rshift_int(y_position, plane_shifts_y[i]);
+            VkImageAspectFlags main_aspect;
+            VkImageAspectFlags overlay_aspect;
+
+            main_view = get_plane_vulkan_view(main_surface, plane_types[i], "copy-main", ctx->log_ctx);
+            overlay_view = get_plane_vulkan_view(overlay_surface, plane_types[i], "copy-overlay", ctx->log_ctx);
+            if (!main_view || !overlay_view) {
+                err = AVERROR_EXTERNAL;
+                goto fail;
+            }
+
+            if (!clamp_overlay_region(main_view->iPlaneWidth, main_view->iPlaneHeight,
+                                      overlay_view->iPlaneWidth, overlay_view->iPlaneHeight,
+                                      plane_x, plane_y,
+                                      &copy_planes[nb_valid_copy_planes].src_offset,
+                                      &copy_planes[nb_valid_copy_planes].dst_offset,
+                                      &copy_planes[nb_valid_copy_planes].extent)) {
+                continue;
+            }
+
+            main_aspect = resolve_copy_aspect(main_view->pSurface, plane_aspects[i]);
+            overlay_aspect = resolve_copy_aspect(overlay_view->pSurface, plane_aspects[i]);
+            if (main_aspect != overlay_aspect) {
+                av_log(ctx->log_ctx, AV_LOG_ERROR,
+                       "overlay_amf: opaque copy aspect mismatch between main and overlay planes\n");
+                err = AVERROR(EINVAL);
+                goto fail;
+            }
+
+            copy_planes[nb_valid_copy_planes].main_view = main_view;
+            copy_planes[nb_valid_copy_planes].overlay_view = overlay_view;
+            copy_planes[nb_valid_copy_planes].aspect_mask = main_aspect;
+            nb_valid_copy_planes++;
+        }
+
+        if (!nb_valid_copy_planes) {
+            av_log(ctx->log_ctx, AV_LOG_VERBOSE,
+                   "overlay_amf: all opaque copy planes clipped at (%d,%d) for overlay %dx%d\n",
+                   x_position, y_position, overlay_width, overlay_height);
+            if (ctx->unlock)
+                ctx->unlock(ctx->lock_ctx);
+            return 0;
         }
 
         if (async_submit) {
@@ -1406,14 +1620,12 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
         }
 
         av_log(ctx->log_ctx, AV_LOG_VERBOSE,
-               "overlay_amf: Vulkan opaque copy dst=(%d,%d) src=(%d,%d) size=%ux%u%s\n",
-               dst_offset.x, dst_offset.y, src_offset.x, src_offset.y,
-               extent.width, extent.height,
+               "overlay_amf: Vulkan opaque copy using %u plane(s) for AMF surface format %d%s\n",
+               nb_valid_copy_planes, (int)main_surface->GetFormat(),
                overlay_has_alpha ? " (alpha currently copied opaquely)" : "");
 
-        err = execute_opaque_copy(ctx, main_view, overlay_view,
-                                  main_surface, overlay_surface,
-                                  &src_offset, &dst_offset, &extent);
+        err = execute_opaque_copy(ctx, copy_planes, nb_valid_copy_planes,
+                                  main_surface, overlay_surface);
         if (err < 0)
             goto fail;
     }
