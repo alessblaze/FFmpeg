@@ -32,7 +32,8 @@ int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
                                int enable_alpha_blend,
                                int async_submit,
                                int premultiplied_alpha,
-                               float global_alpha);
+                               float global_alpha,
+                               int p010_debug_mode);
 
 #ifdef __cplusplus
 }

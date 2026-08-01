@@ -39,6 +39,11 @@ typedef struct AMFFilterContext {
     int out_color_range;
     int out_primaries;
     int out_trc;
+    int input_tonemapping;
+    int output_tonemapping;
+    int linear_rgb;
+    int use_decoder_hdr_metadata;
+    int normalize_rgb_trc;
     int fill;
     int fill_color;
     int keep_ratio;

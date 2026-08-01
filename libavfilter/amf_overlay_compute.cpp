@@ -6,6 +6,7 @@ extern "C" {
 
 #include "amf_overlay_compute.h"
 #include "amf_overlay_alpha_comp_spv.h"
+#include "amf_overlay_p010_alpha_comp_spv.h"
 
 #include <AMF/core/Compute.h>
 #include <AMF/core/Context.h>
@@ -37,12 +38,30 @@ typedef struct OverlayAlphaPushConstants {
     float global_alpha;
 } OverlayAlphaPushConstants;
 
+typedef struct OverlayP010AlphaPushConstants {
+    int32_t dst_y_origin[2];
+    int32_t y_size[2];
+    int32_t src_y_origin[2];
+    int32_t dst_uv_origin[2];
+    int32_t uv_size[2];
+    int32_t src_uv_origin[2];
+    float global_alpha;
+    int32_t debug_mode;
+    int32_t pad[2];
+} OverlayP010AlphaPushConstants;
+
 typedef struct OverlayAlphaJob {
     VkCommandPool command_pool;
     VkCommandBuffer command_buffer;
     VkFence fence;
     VkDescriptorPool desc_pool;
     VkDescriptorSet desc_set;
+    VkDescriptorPool p010_desc_pool;
+    VkDescriptorSet p010_desc_set;
+    VkImageView p010_main_y_view;
+    VkImageView p010_main_uv_view;
+    VkImageView p010_overlay_y_view;
+    VkImageView p010_overlay_uv_view;
     amf::AMFSurface *main_surface_ref;
     amf::AMFSurface *overlay_surface_ref;
     amf::AMFVulkanSync *tracked_syncs[OVERLAY_AMF_MAX_SYNC_RESOURCES];
@@ -87,6 +106,10 @@ struct FFAMFOverlayComputeContext {
     VkPipelineLayout alpha_pipeline_layout;
     VkPipeline alpha_pipeline;
     VkShaderModule alpha_comp_module;
+    VkDescriptorSetLayout p010_alpha_desc_set_layout;
+    VkPipelineLayout p010_alpha_pipeline_layout;
+    VkPipeline p010_alpha_pipeline;
+    VkShaderModule p010_alpha_comp_module;
 
     void (*lock)(void *lock_ctx);
     void (*unlock)(void *lock_ctx);
@@ -128,6 +151,26 @@ static void reset_alpha_job_tracking(OverlayAlphaJob *job)
     job->in_flight = 0;
 }
 
+static void destroy_p010_job_views(FFAMFOverlayComputeContext *ctx, OverlayAlphaJob *job)
+{
+    if (!ctx || !ctx->device || !ctx->device->hDevice || !job)
+        return;
+
+    if (job->p010_main_y_view)
+        vkDestroyImageView(ctx->device->hDevice, job->p010_main_y_view, nullptr);
+    if (job->p010_main_uv_view)
+        vkDestroyImageView(ctx->device->hDevice, job->p010_main_uv_view, nullptr);
+    if (job->p010_overlay_y_view)
+        vkDestroyImageView(ctx->device->hDevice, job->p010_overlay_y_view, nullptr);
+    if (job->p010_overlay_uv_view)
+        vkDestroyImageView(ctx->device->hDevice, job->p010_overlay_uv_view, nullptr);
+
+    job->p010_main_y_view = VK_NULL_HANDLE;
+    job->p010_main_uv_view = VK_NULL_HANDLE;
+    job->p010_overlay_y_view = VK_NULL_HANDLE;
+    job->p010_overlay_uv_view = VK_NULL_HANDLE;
+}
+
 static int wait_alpha_job(FFAMFOverlayComputeContext *ctx, OverlayAlphaJob *job)
 {
     VkResult res;
@@ -154,6 +197,8 @@ static int wait_alpha_job(FFAMFOverlayComputeContext *ctx, OverlayAlphaJob *job)
         job->overlay_surface_ref = nullptr;
     }
 
+    destroy_p010_job_views(ctx, job);
+
     job->nb_tracked_syncs = 0;
     job->in_flight = 0;
     return 0;
@@ -168,6 +213,9 @@ static void destroy_alpha_job(FFAMFOverlayComputeContext *ctx, OverlayAlphaJob *
 
     if (job->desc_pool)
         vkDestroyDescriptorPool(ctx->device->hDevice, job->desc_pool, nullptr);
+    if (job->p010_desc_pool)
+        vkDestroyDescriptorPool(ctx->device->hDevice, job->p010_desc_pool, nullptr);
+    destroy_p010_job_views(ctx, job);
     if (job->fence)
         vkDestroyFence(ctx->device->hDevice, job->fence, nullptr);
     if (job->command_pool)
@@ -175,6 +223,8 @@ static void destroy_alpha_job(FFAMFOverlayComputeContext *ctx, OverlayAlphaJob *
 
     job->desc_pool = VK_NULL_HANDLE;
     job->desc_set = VK_NULL_HANDLE;
+    job->p010_desc_pool = VK_NULL_HANDLE;
+    job->p010_desc_set = VK_NULL_HANDLE;
     job->fence = VK_NULL_HANDLE;
     job->command_pool = VK_NULL_HANDLE;
     job->command_buffer = VK_NULL_HANDLE;
@@ -188,8 +238,11 @@ static void destroy_alpha_pipeline(FFAMFOverlayComputeContext *ctx)
 
     if (ctx->alpha_pipeline)
         vkDestroyPipeline(ctx->device->hDevice, ctx->alpha_pipeline, nullptr);
+    if (ctx->p010_alpha_pipeline)
+        vkDestroyPipeline(ctx->device->hDevice, ctx->p010_alpha_pipeline, nullptr);
 
     ctx->alpha_pipeline = VK_NULL_HANDLE;
+    ctx->p010_alpha_pipeline = VK_NULL_HANDLE;
 }
 
 static void destroy_alpha_objects(FFAMFOverlayComputeContext *ctx)
@@ -201,16 +254,25 @@ static void destroy_alpha_objects(FFAMFOverlayComputeContext *ctx)
 
     if (ctx->alpha_comp_module)
         vkDestroyShaderModule(ctx->device->hDevice, ctx->alpha_comp_module, nullptr);
+    if (ctx->p010_alpha_comp_module)
+        vkDestroyShaderModule(ctx->device->hDevice, ctx->p010_alpha_comp_module, nullptr);
     if (ctx->alpha_pipeline_layout)
         vkDestroyPipelineLayout(ctx->device->hDevice, ctx->alpha_pipeline_layout, nullptr);
+    if (ctx->p010_alpha_pipeline_layout)
+        vkDestroyPipelineLayout(ctx->device->hDevice, ctx->p010_alpha_pipeline_layout, nullptr);
     if (ctx->alpha_desc_set_layout)
         vkDestroyDescriptorSetLayout(ctx->device->hDevice, ctx->alpha_desc_set_layout, nullptr);
+    if (ctx->p010_alpha_desc_set_layout)
+        vkDestroyDescriptorSetLayout(ctx->device->hDevice, ctx->p010_alpha_desc_set_layout, nullptr);
     if (ctx->alpha_sampler)
         vkDestroySampler(ctx->device->hDevice, ctx->alpha_sampler, nullptr);
 
     ctx->alpha_comp_module = VK_NULL_HANDLE;
+    ctx->p010_alpha_comp_module = VK_NULL_HANDLE;
     ctx->alpha_pipeline_layout = VK_NULL_HANDLE;
+    ctx->p010_alpha_pipeline_layout = VK_NULL_HANDLE;
     ctx->alpha_desc_set_layout = VK_NULL_HANDLE;
+    ctx->p010_alpha_desc_set_layout = VK_NULL_HANDLE;
     ctx->alpha_sampler = VK_NULL_HANDLE;
 }
 
@@ -354,6 +416,49 @@ static int floor_rshift_int(int value, unsigned shift)
     return -(((-value) + (1 << shift) - 1) >> shift);
 }
 
+static int ceil_rshift_positive_int(int value, unsigned shift)
+{
+    if (!shift)
+        return value;
+    return (value + (1 << shift) - 1) >> shift;
+}
+
+static int create_surface_plane_view(FFAMFOverlayComputeContext *ctx,
+                                     amf::AMFVulkanSurface *surface,
+                                     VkImageAspectFlags aspect_mask,
+                                     VkFormat format,
+                                     VkImageView *view,
+                                     const char *what)
+{
+    VkImageViewCreateInfo view_info = {};
+    VkResult res;
+
+    if (!surface || !view)
+        return AVERROR(EINVAL);
+
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = surface->hImage;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.components = {
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+    view_info.subresourceRange.aspectMask = aspect_mask;
+    view_info.subresourceRange.baseMipLevel = 0;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.baseArrayLayer = 0;
+    view_info.subresourceRange.layerCount = 1;
+
+    res = vkCreateImageView(ctx->device->hDevice, &view_info, nullptr, view);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, what, res);
+
+    return 0;
+}
+
 static int get_copy_layout_from_surface_format(amf::AMF_SURFACE_FORMAT format,
                                                amf::AMF_PLANE_TYPE plane_types[OVERLAY_AMF_MAX_COPY_PLANES],
                                                VkImageAspectFlags plane_aspects[OVERLAY_AMF_MAX_COPY_PLANES],
@@ -365,7 +470,6 @@ static int get_copy_layout_from_surface_format(amf::AMF_SURFACE_FORMAT format,
     case amf::AMF_SURFACE_BGRA:
     case amf::AMF_SURFACE_RGBA:
     case amf::AMF_SURFACE_ARGB:
-    case amf::AMF_SURFACE_R10G10B10A2:
     case amf::AMF_SURFACE_RGBA_F16:
     case amf::AMF_SURFACE_YUY2:
         plane_types[0] = amf::AMF_PLANE_PACKED;
@@ -694,6 +798,56 @@ static int create_alpha_resources(FFAMFOverlayComputeContext *ctx)
     return 0;
 }
 
+static int create_p010_alpha_resources(FFAMFOverlayComputeContext *ctx)
+{
+    VkDescriptorSetLayoutBinding bindings[6] = {};
+    VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+    VkPushConstantRange push_range = {};
+    VkPipelineLayoutCreateInfo layout_info = {};
+    VkResult res;
+    int err;
+
+    for (unsigned i = 0; i < FF_ARRAY_ELEMS(bindings); i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+
+    set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set_layout_info.bindingCount = FF_ARRAY_ELEMS(bindings);
+    set_layout_info.pBindings = bindings;
+
+    res = vkCreateDescriptorSetLayout(ctx->device->hDevice, &set_layout_info, nullptr,
+                                      &ctx->p010_alpha_desc_set_layout);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkCreateDescriptorSetLayout(P010 alpha)", res);
+
+    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(OverlayP010AlphaPushConstants);
+
+    layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &ctx->p010_alpha_desc_set_layout;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+
+    res = vkCreatePipelineLayout(ctx->device->hDevice, &layout_info, nullptr,
+                                 &ctx->p010_alpha_pipeline_layout);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkCreatePipelineLayout(P010 alpha)", res);
+
+    err = create_shader_module(ctx, overlay_amf_p010_alpha_comp_spv,
+                               overlay_amf_p010_alpha_comp_spv_len,
+                               &ctx->p010_alpha_comp_module,
+                               "vkCreateShaderModule(P010 alpha comp)");
+    if (err < 0)
+        return err;
+
+    return 0;
+}
+
 static int create_alpha_job_descriptors(FFAMFOverlayComputeContext *ctx, OverlayAlphaJob *job)
 {
     VkDescriptorPoolSize pool_sizes[2] = {};
@@ -727,6 +881,40 @@ static int create_alpha_job_descriptors(FFAMFOverlayComputeContext *ctx, Overlay
     return 0;
 }
 
+static int create_p010_alpha_job_descriptors(FFAMFOverlayComputeContext *ctx,
+                                             OverlayAlphaJob *job)
+{
+    VkDescriptorPoolSize pool_size = {};
+    VkDescriptorPoolCreateInfo pool_info = {};
+    VkDescriptorSetAllocateInfo set_alloc_info = {};
+    VkResult res;
+
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    pool_size.descriptorCount = 6;
+
+    pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pool_info.maxSets = 1;
+    pool_info.poolSizeCount = 1;
+    pool_info.pPoolSizes = &pool_size;
+
+    res = vkCreateDescriptorPool(ctx->device->hDevice, &pool_info, nullptr,
+                                 &job->p010_desc_pool);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkCreateDescriptorPool(P010 alpha)", res);
+
+    set_alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    set_alloc_info.descriptorPool = job->p010_desc_pool;
+    set_alloc_info.descriptorSetCount = 1;
+    set_alloc_info.pSetLayouts = &ctx->p010_alpha_desc_set_layout;
+
+    res = vkAllocateDescriptorSets(ctx->device->hDevice, &set_alloc_info,
+                                   &job->p010_desc_set);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkAllocateDescriptorSets(P010 alpha)", res);
+
+    return 0;
+}
+
 static int create_alpha_jobs(FFAMFOverlayComputeContext *ctx)
 {
     int err;
@@ -740,12 +928,22 @@ static int create_alpha_jobs(FFAMFOverlayComputeContext *ctx)
         job->fence = VK_NULL_HANDLE;
         job->desc_pool = VK_NULL_HANDLE;
         job->desc_set = VK_NULL_HANDLE;
+        job->p010_desc_pool = VK_NULL_HANDLE;
+        job->p010_desc_set = VK_NULL_HANDLE;
+        job->p010_main_y_view = VK_NULL_HANDLE;
+        job->p010_main_uv_view = VK_NULL_HANDLE;
+        job->p010_overlay_y_view = VK_NULL_HANDLE;
+        job->p010_overlay_uv_view = VK_NULL_HANDLE;
 
         err = create_alpha_job_command_objects(ctx, job);
         if (err < 0)
             return err;
 
         err = create_alpha_job_descriptors(ctx, job);
+        if (err < 0)
+            return err;
+
+        err = create_p010_alpha_job_descriptors(ctx, job);
         if (err < 0)
             return err;
     }
@@ -777,6 +975,34 @@ static int ensure_alpha_pipeline(FFAMFOverlayComputeContext *ctx)
                                    &pipeline_info, nullptr, &ctx->alpha_pipeline);
     if (res != VK_SUCCESS)
         return vk_result_to_averror(ctx->log_ctx, "vkCreateComputePipelines", res);
+
+    return 0;
+}
+
+static int ensure_p010_alpha_pipeline(FFAMFOverlayComputeContext *ctx)
+{
+    VkPipelineShaderStageCreateInfo stage = {};
+    VkComputePipelineCreateInfo pipeline_info = {};
+    VkResult res;
+
+    if (ctx->p010_alpha_pipeline)
+        return 0;
+
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = ctx->p010_alpha_comp_module;
+    stage.pName = "main";
+
+    pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipeline_info.stage = stage;
+    pipeline_info.layout = ctx->p010_alpha_pipeline_layout;
+
+    res = vkCreateComputePipelines(ctx->device->hDevice, VK_NULL_HANDLE, 1,
+                                   &pipeline_info, nullptr,
+                                   &ctx->p010_alpha_pipeline);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx,
+                                    "vkCreateComputePipelines(P010 alpha)", res);
 
     return 0;
 }
@@ -1108,15 +1334,338 @@ static int execute_alpha_blend(FFAMFOverlayComputeContext *ctx,
     return 0;
 }
 
+static int execute_p010_alpha_blend(FFAMFOverlayComputeContext *ctx,
+                                    amf::AMFVulkanView *main_y_view,
+                                    amf::AMFVulkanView *main_uv_view,
+                                    amf::AMFVulkanView *overlay_y_view,
+                                    amf::AMFVulkanView *overlay_uv_view,
+                                    amf::AMFSurface *main_surface,
+                                    amf::AMFSurface *overlay_surface,
+                                    const VkOffset3D *src_offset,
+                                    const VkOffset3D *dst_offset,
+                                    const VkExtent3D *extent,
+                                    int async_submit,
+                                    float global_alpha,
+                                    int p010_debug_mode)
+{
+    OverlayAlphaJob *job;
+    OverlayPendingSync pending_syncs[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
+    OverlayCopySurface main_surfaces[OVERLAY_AMF_MAX_COPY_SURFACES] = {};
+    OverlayCopySurface overlay_surfaces[OVERLAY_AMF_MAX_COPY_SURFACES] = {};
+    VkCommandBufferBeginInfo begin_info = {};
+    VkDescriptorImageInfo image_infos[6] = {};
+    VkWriteDescriptorSet writes[6] = {};
+    OverlayP010AlphaPushConstants push = {};
+    VkSubmitInfo submit = {};
+    VkTimelineSemaphoreSubmitInfo timeline_submit = {};
+    VkSemaphore wait_semaphores[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
+    VkPipelineStageFlags wait_stages[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
+    uint64_t wait_values[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
+    VkSemaphore signal_semaphores[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
+    uint64_t signal_values[OVERLAY_AMF_MAX_SYNC_RESOURCES] = {};
+    unsigned nb_main_surfaces = 0;
+    unsigned nb_overlay_surfaces = 0;
+    unsigned pending_count = 0;
+    uint32_t wait_count = 0;
+    uint32_t signal_count = 0;
+    int y_width;
+    int y_height;
+    int dst_uv_x;
+    int dst_uv_y;
+    int src_uv_x;
+    int src_uv_y;
+    int uv_width;
+    int uv_height;
+    uint32_t dispatch_width;
+    uint32_t dispatch_height;
+    VkImageAspectFlags main_y_aspect;
+    VkImageAspectFlags main_uv_aspect;
+    VkImageAspectFlags overlay_y_aspect;
+    VkImageAspectFlags overlay_uv_aspect;
+    VkResult res;
+    int err;
+
+    err = ensure_p010_alpha_pipeline(ctx);
+    if (err < 0)
+        return err;
+
+    y_width = FFMIN((int)extent->width, main_y_view->iPlaneWidth - dst_offset->x);
+    y_width = FFMIN(y_width, overlay_y_view->iPlaneWidth - src_offset->x);
+    y_height = FFMIN((int)extent->height, main_y_view->iPlaneHeight - dst_offset->y);
+    y_height = FFMIN(y_height, overlay_y_view->iPlaneHeight - src_offset->y);
+    if (y_width <= 0 || y_height <= 0)
+        return 0;
+
+    dst_uv_x = floor_rshift_int(dst_offset->x, 1);
+    dst_uv_y = floor_rshift_int(dst_offset->y, 1);
+    src_uv_x = floor_rshift_int(src_offset->x, 1);
+    src_uv_y = floor_rshift_int(src_offset->y, 1);
+    uv_width = ceil_rshift_positive_int(dst_offset->x + y_width, 1) - dst_uv_x;
+    uv_width = FFMIN(uv_width,
+                     ceil_rshift_positive_int(src_offset->x + y_width, 1) - src_uv_x);
+    uv_width = FFMIN(uv_width, main_uv_view->iPlaneWidth - dst_uv_x);
+    uv_width = FFMIN(uv_width, overlay_uv_view->iPlaneWidth - src_uv_x);
+    uv_height = ceil_rshift_positive_int(dst_offset->y + y_height, 1) - dst_uv_y;
+    uv_height = FFMIN(uv_height,
+                      ceil_rshift_positive_int(src_offset->y + y_height, 1) - src_uv_y);
+    uv_height = FFMIN(uv_height, main_uv_view->iPlaneHeight - dst_uv_y);
+    uv_height = FFMIN(uv_height, overlay_uv_view->iPlaneHeight - src_uv_y);
+    if (uv_width < 0)
+        uv_width = 0;
+    if (uv_height < 0)
+        uv_height = 0;
+
+    main_y_aspect = resolve_copy_aspect(main_y_view->pSurface, VK_IMAGE_ASPECT_PLANE_0_BIT);
+    main_uv_aspect = resolve_copy_aspect(main_uv_view->pSurface, VK_IMAGE_ASPECT_PLANE_1_BIT);
+    overlay_y_aspect = resolve_copy_aspect(overlay_y_view->pSurface, VK_IMAGE_ASPECT_PLANE_0_BIT);
+    overlay_uv_aspect = resolve_copy_aspect(overlay_uv_view->pSurface, VK_IMAGE_ASPECT_PLANE_1_BIT);
+
+    err = append_copy_surface(main_surfaces, &nb_main_surfaces,
+                              main_y_view->pSurface, main_y_aspect);
+    if (err < 0)
+        return err;
+    err = append_copy_surface(main_surfaces, &nb_main_surfaces,
+                              main_uv_view->pSurface, main_uv_aspect);
+    if (err < 0)
+        return err;
+    err = append_copy_surface(overlay_surfaces, &nb_overlay_surfaces,
+                              overlay_y_view->pSurface, overlay_y_aspect);
+    if (err < 0)
+        return err;
+    err = append_copy_surface(overlay_surfaces, &nb_overlay_surfaces,
+                              overlay_uv_view->pSurface, overlay_uv_aspect);
+    if (err < 0)
+        return err;
+
+    job = select_alpha_job(ctx, async_submit);
+    if (!job)
+        return AVERROR_EXTERNAL;
+
+    if (!async_submit && job->in_flight) {
+        err = wait_alpha_job(ctx, job);
+        if (err < 0)
+            return err;
+    }
+
+    destroy_p010_job_views(ctx, job);
+
+    err = create_surface_plane_view(ctx, main_y_view->pSurface,
+                                    VK_IMAGE_ASPECT_PLANE_0_BIT,
+                                    VK_FORMAT_R16_UNORM,
+                                    &job->p010_main_y_view,
+                                    "vkCreateImageView(P010 main Y)");
+    if (err < 0)
+        goto fail;
+    err = create_surface_plane_view(ctx, main_uv_view->pSurface,
+                                    VK_IMAGE_ASPECT_PLANE_1_BIT,
+                                    VK_FORMAT_R16G16_UNORM,
+                                    &job->p010_main_uv_view,
+                                    "vkCreateImageView(P010 main UV)");
+    if (err < 0)
+        goto fail;
+    err = create_surface_plane_view(ctx, overlay_y_view->pSurface,
+                                    VK_IMAGE_ASPECT_PLANE_0_BIT,
+                                    VK_FORMAT_R16_UNORM,
+                                    &job->p010_overlay_y_view,
+                                    "vkCreateImageView(P010 overlay Y)");
+    if (err < 0)
+        goto fail;
+    err = create_surface_plane_view(ctx, overlay_uv_view->pSurface,
+                                    VK_IMAGE_ASPECT_PLANE_1_BIT,
+                                    VK_FORMAT_R16G16_UNORM,
+                                    &job->p010_overlay_uv_view,
+                                    "vkCreateImageView(P010 overlay UV)");
+    if (err < 0)
+        goto fail;
+
+    for (unsigned i = 0; i < nb_main_surfaces; i++) {
+        if (pending_count >= OVERLAY_AMF_MAX_SYNC_RESOURCES)
+            return AVERROR(EINVAL);
+        err = collect_surface_sync(ctx, &main_surfaces[i].surface->Sync, &pending_syncs[pending_count++],
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   wait_semaphores, wait_stages, wait_values, &wait_count,
+                                   signal_semaphores, signal_values, &signal_count);
+        if (err < 0)
+            return err;
+    }
+    for (unsigned i = 0; i < nb_overlay_surfaces; i++) {
+        if (pending_count >= OVERLAY_AMF_MAX_SYNC_RESOURCES)
+            return AVERROR(EINVAL);
+        err = collect_surface_sync(ctx, &overlay_surfaces[i].surface->Sync, &pending_syncs[pending_count++],
+                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   wait_semaphores, wait_stages, wait_values, &wait_count,
+                                   signal_semaphores, signal_values, &signal_count);
+        if (err < 0)
+            return err;
+    }
+
+    res = vkResetFences(ctx->device->hDevice, 1, &job->fence);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkResetFences", res);
+
+    res = vkResetCommandBuffer(job->command_buffer, 0);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkResetCommandBuffer", res);
+
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    res = vkBeginCommandBuffer(job->command_buffer, &begin_info);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkBeginCommandBuffer", res);
+
+    for (unsigned i = 0; i < nb_main_surfaces; i++) {
+        transition_surface(job->command_buffer, main_surfaces[i].surface,
+                           main_surfaces[i].aspect_mask,
+                           VK_IMAGE_LAYOUT_GENERAL,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+    for (unsigned i = 0; i < nb_overlay_surfaces; i++) {
+        transition_surface(job->command_buffer, overlay_surfaces[i].surface,
+                           overlay_surfaces[i].aspect_mask,
+                           VK_IMAGE_LAYOUT_GENERAL,
+                           VK_ACCESS_SHADER_READ_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    }
+
+    image_infos[0].imageView = job->p010_main_y_view;
+    image_infos[0].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_infos[1].imageView = job->p010_main_y_view;
+    image_infos[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_infos[2].imageView = job->p010_overlay_y_view;
+    image_infos[2].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_infos[3].imageView = job->p010_main_uv_view;
+    image_infos[3].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_infos[4].imageView = job->p010_main_uv_view;
+    image_infos[4].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    image_infos[5].imageView = job->p010_overlay_uv_view;
+    image_infos[5].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    for (unsigned i = 0; i < FF_ARRAY_ELEMS(writes); i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = job->p010_desc_set;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[i].pImageInfo = &image_infos[i];
+    }
+    vkUpdateDescriptorSets(ctx->device->hDevice, FF_ARRAY_ELEMS(writes), writes, 0, nullptr);
+
+    push.dst_y_origin[0] = dst_offset->x;
+    push.dst_y_origin[1] = dst_offset->y;
+    push.y_size[0] = y_width;
+    push.y_size[1] = y_height;
+    push.src_y_origin[0] = src_offset->x;
+    push.src_y_origin[1] = src_offset->y;
+    push.dst_uv_origin[0] = dst_uv_x;
+    push.dst_uv_origin[1] = dst_uv_y;
+    push.uv_size[0] = uv_width;
+    push.uv_size[1] = uv_height;
+    push.src_uv_origin[0] = src_uv_x;
+    push.src_uv_origin[1] = src_uv_y;
+    push.global_alpha = global_alpha;
+    push.debug_mode = p010_debug_mode;
+
+    dispatch_width = FFMAX(y_width, uv_width);
+    dispatch_height = FFMAX(y_height, uv_height);
+
+    vkCmdBindPipeline(job->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      ctx->p010_alpha_pipeline);
+    vkCmdBindDescriptorSets(job->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            ctx->p010_alpha_pipeline_layout, 0, 1,
+                            &job->p010_desc_set, 0, nullptr);
+    vkCmdPushConstants(job->command_buffer, ctx->p010_alpha_pipeline_layout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(job->command_buffer,
+                  (dispatch_width + 7) / 8,
+                  (dispatch_height + 7) / 8,
+                  1);
+
+    insert_memory_visibility_barrier(job->command_buffer,
+                                     VK_ACCESS_SHADER_WRITE_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+
+    for (unsigned i = 0; i < nb_main_surfaces; i++) {
+        transition_surface(job->command_buffer, main_surfaces[i].surface,
+                           main_surfaces[i].aspect_mask,
+                           main_surfaces[i].old_layout,
+                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
+    for (unsigned i = 0; i < nb_overlay_surfaces; i++) {
+        transition_surface(job->command_buffer, overlay_surfaces[i].surface,
+                           overlay_surfaces[i].aspect_mask,
+                           overlay_surfaces[i].old_layout,
+                           VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+    }
+
+    res = vkEndCommandBuffer(job->command_buffer);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkEndCommandBuffer", res);
+
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.waitSemaphoreCount = wait_count;
+    submit.pWaitSemaphores = wait_count ? wait_semaphores : nullptr;
+    submit.pWaitDstStageMask = wait_count ? wait_stages : nullptr;
+    submit.signalSemaphoreCount = signal_count;
+    submit.pSignalSemaphores = signal_count ? signal_semaphores : nullptr;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &job->command_buffer;
+
+    timeline_submit.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline_submit.waitSemaphoreValueCount = wait_count;
+    timeline_submit.pWaitSemaphoreValues = wait_count ? wait_values : nullptr;
+    timeline_submit.signalSemaphoreValueCount = signal_count;
+    timeline_submit.pSignalSemaphoreValues = signal_count ? signal_values : nullptr;
+    submit.pNext = &timeline_submit;
+
+    res = vkQueueSubmit(ctx->queue, 1, &submit, job->fence);
+    if (res != VK_SUCCESS)
+        return vk_result_to_averror(ctx->log_ctx, "vkQueueSubmit", res);
+
+    job->nb_tracked_syncs = 0;
+    for (unsigned i = 0; i < OVERLAY_AMF_MAX_SYNC_RESOURCES; i++) {
+        if (!pending_syncs[i].sync)
+            continue;
+
+        if (pending_syncs[i].timeline && pending_syncs[i].signaled)
+            pending_syncs[i].timeline->uiCount = pending_syncs[i].signal_value;
+        if (pending_syncs[i].sync->hSemaphore != VK_NULL_HANDLE && pending_syncs[i].signaled)
+            pending_syncs[i].sync->bSubmitted = true;
+        pending_syncs[i].sync->hFence = job->fence;
+        job->tracked_syncs[job->nb_tracked_syncs++] = pending_syncs[i].sync;
+    }
+
+    main_surface->Acquire();
+    job->main_surface_ref = main_surface;
+    overlay_surface->Acquire();
+    job->overlay_surface_ref = overlay_surface;
+    job->in_flight = 1;
+
+    if (!async_submit) {
+        err = wait_alpha_job(ctx, job);
+        if (err < 0)
+            goto fail;
+    }
+
+    return 0;
+
+fail:
+    if (job && !job->in_flight)
+        destroy_p010_job_views(ctx, job);
+    return err;
+}
+
 static void transition_surface(VkCommandBuffer cmd, amf::AMFVulkanSurface *surface,
                                VkImageAspectFlags aspect_mask,
                                VkImageLayout new_layout,
                                VkAccessFlags dst_access,
                                VkPipelineStageFlags dst_stage)
 {
-    if ((VkImageLayout)surface->eCurrentLayout == new_layout)
-        return;
-
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = static_cast<VkImageLayout>(surface->eCurrentLayout);
@@ -1380,6 +1929,10 @@ extern "C" int ff_amf_overlay_compute_init(FFAMFOverlayComputeContext **ctx,
     compute_ctx->alpha_pipeline_layout = VK_NULL_HANDLE;
     compute_ctx->alpha_pipeline = VK_NULL_HANDLE;
     compute_ctx->alpha_comp_module = VK_NULL_HANDLE;
+    compute_ctx->p010_alpha_desc_set_layout = VK_NULL_HANDLE;
+    compute_ctx->p010_alpha_pipeline_layout = VK_NULL_HANDLE;
+    compute_ctx->p010_alpha_pipeline = VK_NULL_HANDLE;
+    compute_ctx->p010_alpha_comp_module = VK_NULL_HANDLE;
     compute_ctx->lock = device_ctx->lock;
     compute_ctx->unlock = device_ctx->unlock;
     compute_ctx->lock_ctx = device_ctx->lock_ctx;
@@ -1437,6 +1990,12 @@ extern "C" int ff_amf_overlay_compute_init(FFAMFOverlayComputeContext **ctx,
         return err;
     }
 
+    err = create_p010_alpha_resources(compute_ctx);
+    if (err < 0) {
+        ff_amf_overlay_compute_uninit(&compute_ctx);
+        return err;
+    }
+
     err = create_alpha_jobs(compute_ctx);
     if (err < 0) {
         ff_amf_overlay_compute_uninit(&compute_ctx);
@@ -1480,7 +2039,8 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
                                           int enable_alpha_blend,
                                           int async_submit,
                                           int premultiplied_alpha,
-                                          float global_alpha)
+                                          float global_alpha,
+                                          int p010_debug_mode)
 {
     amf::AMFVulkanView *main_view = nullptr;
     amf::AMFVulkanView *overlay_view = nullptr;
@@ -1519,7 +2079,46 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
         return 0;
     }
 
-    if (overlay_has_alpha && enable_alpha_blend) {
+    if (enable_alpha_blend && main_surface->GetFormat() == amf::AMF_SURFACE_P010) {
+        amf::AMFVulkanView *main_y_view;
+        amf::AMFVulkanView *main_uv_view;
+        amf::AMFVulkanView *overlay_y_view;
+        amf::AMFVulkanView *overlay_uv_view;
+
+        main_y_view = get_plane_vulkan_view(main_surface, amf::AMF_PLANE_Y,
+                                            "P010 alpha main Y", ctx->log_ctx);
+        main_uv_view = get_plane_vulkan_view(main_surface, amf::AMF_PLANE_UV,
+                                             "P010 alpha main UV", ctx->log_ctx);
+        overlay_y_view = get_plane_vulkan_view(overlay_surface, amf::AMF_PLANE_Y,
+                                               "P010 alpha overlay Y", ctx->log_ctx);
+        overlay_uv_view = get_plane_vulkan_view(overlay_surface, amf::AMF_PLANE_UV,
+                                                "P010 alpha overlay UV", ctx->log_ctx);
+        if (!main_y_view || !main_uv_view || !overlay_y_view || !overlay_uv_view) {
+            err = AVERROR_EXTERNAL;
+            goto fail;
+        }
+
+        if (async_submit && main_y_view->pSurface->Sync.hSemaphore == VK_NULL_HANDLE) {
+            av_log(ctx->log_ctx, AV_LOG_VERBOSE,
+                   "overlay_amf: async_submit=1 requested but main P010 surface has no AMF Vulkan sync semaphore; falling back to blocking submit\n");
+            async_submit = 0;
+        }
+
+        av_log(ctx->log_ctx, AV_LOG_VERBOSE,
+               "overlay_amf: Vulkan compute P010 global-alpha blend Y dst=(%d,%d) src=(%d,%d) size=%ux%u global_alpha=%g async=%d\n",
+               dst_offset.x, dst_offset.y, src_offset.x, src_offset.y,
+               extent.width, extent.height, global_alpha, async_submit);
+
+        err = execute_p010_alpha_blend(ctx,
+                                       main_y_view, main_uv_view,
+                                       overlay_y_view, overlay_uv_view,
+                                       main_surface, overlay_surface,
+                                       &src_offset, &dst_offset, &extent,
+                                       async_submit, global_alpha,
+                                       p010_debug_mode);
+        if (err < 0)
+            goto fail;
+    } else if (overlay_has_alpha && enable_alpha_blend) {
         main_view = get_packed_vulkan_view(main_surface, ctx->log_ctx);
         overlay_view = get_packed_vulkan_view(overlay_surface, ctx->log_ctx);
         if (!main_view || !overlay_view) {

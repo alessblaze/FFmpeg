@@ -55,6 +55,7 @@ typedef struct OverlayAMFContext {
     int async_submit;
     int premultiplied_alpha;
     int alpha_mode;
+    int p010_debug_mode;
     float global_alpha;
     enum AMF_SURFACE_FORMAT main_surface_format;
 } OverlayAMFContext;
@@ -149,7 +150,9 @@ static enum AVPixelFormat overlay_amf_output_sw_format(enum AVPixelFormat fmt)
 static int overlay_amf_sw_format_has_alpha(enum AVPixelFormat fmt)
 {
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
-    return desc && !!(desc->flags & AV_PIX_FMT_FLAG_ALPHA);
+    if (desc && (desc->flags & AV_PIX_FMT_FLAG_ALPHA))
+        return 1;
+    return 0;
 }
 
 static AVAMFDeviceContext *overlay_amf_get_device_ctx(AVHWFramesContext *frames_ctx)
@@ -412,7 +415,8 @@ static int overlay_amf_blend(FFFrameSync *fs)
                                      ctx->enable_alpha_blend,
                                      ctx->async_submit,
                                      premultiplied_alpha,
-                                     ctx->global_alpha);
+                                     ctx->global_alpha,
+                                     ctx->p010_debug_mode);
     if (ret < 0)
         goto fail;
 
@@ -449,8 +453,13 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     enum AVPixelFormat in_format;
     int main_is_packed_rgb;
     int overlay_is_packed_rgb;
+    int main_is_p010;
+    int overlay_is_p010;
+    int alpha_is_packed_rgb;
+    int alpha_is_p010;
     int main_is_opaque_format;
     int overlay_is_opaque_format;
+    const char *path_name;
     int ret;
 
     if (!main_inl->hw_frames_ctx || !overlay_inl->hw_frames_ctx) {
@@ -463,19 +472,23 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     device_ctx = overlay_amf_get_device_ctx(main_fc);
     main_is_packed_rgb = overlay_amf_is_supported_packed_rgb_format(main_fc->sw_format);
     overlay_is_packed_rgb = overlay_amf_is_supported_packed_rgb_format(overlay_fc->sw_format);
+    main_is_p010 = main_fc->sw_format == AV_PIX_FMT_P010;
+    overlay_is_p010 = overlay_fc->sw_format == AV_PIX_FMT_P010;
+    alpha_is_packed_rgb = main_is_packed_rgb && overlay_is_packed_rgb;
+    alpha_is_p010 = main_is_p010 && overlay_is_p010;
     main_is_opaque_format = overlay_amf_is_supported_opaque_format(main_fc->sw_format);
     overlay_is_opaque_format = overlay_amf_is_supported_opaque_format(overlay_fc->sw_format);
 
     if (ctx->enable_alpha_blend) {
-        if (!main_is_packed_rgb || !overlay_is_packed_rgb) {
+        if (!alpha_is_packed_rgb && !alpha_is_p010) {
             av_log(avctx, AV_LOG_ERROR,
-                   "overlay_amf alpha_blend=1 requires packed RGB AMF surfaces on both inputs; got %s and %s\n",
+                   "overlay_amf alpha_blend=1 requires matching packed RGB AMF surfaces or matching p010 AMF surfaces; got %s and %s\n",
                    overlay_amf_pix_fmt_name(main_fc->sw_format),
                    overlay_amf_pix_fmt_name(overlay_fc->sw_format));
-            if (!main_is_packed_rgb)
+            if (!main_is_packed_rgb && !main_is_p010)
                 overlay_amf_log_conversion_hint(avctx, device_ctx, main_fc->sw_format,
                                                 AV_PIX_FMT_RGBA, "main");
-            if (!overlay_is_packed_rgb)
+            if (!overlay_is_packed_rgb && !overlay_is_p010)
                 overlay_amf_log_conversion_hint(avctx, device_ctx, overlay_fc->sw_format,
                                                 AV_PIX_FMT_RGBA, "overlay");
             return AVERROR(ENOSYS);
@@ -509,7 +522,7 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
-    if (ctx->enable_alpha_blend &&
+    if (ctx->enable_alpha_blend && alpha_is_packed_rgb &&
         !ctx->overlay_has_alpha) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf alpha_blend=1 requires an alpha-bearing packed RGB overlay surface; got %s over %s\n",
@@ -525,10 +538,11 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     ctx->common.format = overlay_amf_output_sw_format(main_fc->sw_format);
     ctx->common.reset_sar = 0;
 
+    path_name = ctx->enable_alpha_blend && alpha_is_p010 ? "P010 global-alpha blend" :
+                ctx->enable_alpha_blend ? "alpha blend" : "native opaque copy";
     av_log(avctx, AV_LOG_VERBOSE,
            "overlay_amf: using %s AMF surfaces directly on the %s path; no vpp_amf pre-conversion required\n",
-           overlay_amf_pix_fmt_name(main_fc->sw_format),
-           ctx->enable_alpha_blend ? "alpha blend" : "native opaque copy");
+           overlay_amf_pix_fmt_name(main_fc->sw_format), path_name);
 
     ret = amf_init_filter_config(outlink, &in_format);
     if (ret < 0)
@@ -550,13 +564,58 @@ static int overlay_amf_query_formats(const AVFilterContext *avctx,
                                      AVFilterFormatsConfig **cfg_out)
 {
     const OverlayAMFContext *ctx = avctx->priv;
+    static const enum AVPixelFormat input_pix_fmts[] = {
+        AV_PIX_FMT_AMF_SURFACE,
+        AV_PIX_FMT_BGRA,
+        AV_PIX_FMT_RGBA,
+        AV_PIX_FMT_BGR0,
+        AV_PIX_FMT_RGBAF16,
+        AV_PIX_FMT_NV12,
+        AV_PIX_FMT_YUV420P,
+        AV_PIX_FMT_P010,
+        AV_PIX_FMT_NONE,
+    };
+    static const enum AVPixelFormat output_pix_fmts[] = {
+        AV_PIX_FMT_AMF_SURFACE,
+        AV_PIX_FMT_NONE,
+    };
     AVFilterFormats *main_and_output_alpha_modes = NULL;
     AVFilterFormats *overlay_alpha_modes = NULL;
     int alpha_mode = overlay_amf_requested_alpha_mode(ctx);
     int ret;
 
-    ret = ff_set_common_formats2(avctx, cfg_in, cfg_out,
-                                 ff_make_formats_list_singleton(AV_PIX_FMT_AMF_SURFACE));
+    ret = ff_formats_ref(ff_make_pixel_format_list(input_pix_fmts),
+                         &cfg_in[MAIN]->formats);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_formats_ref(ff_make_pixel_format_list(input_pix_fmts),
+                         &cfg_in[OVERLAY]->formats);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_formats_ref(ff_make_pixel_format_list(output_pix_fmts),
+                         &cfg_out[0]->formats);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_formats_ref(ff_all_color_spaces(), &cfg_in[MAIN]->color_spaces);
+    if (ret < 0)
+        return ret;
+    ret = ff_formats_ref(ff_all_color_spaces(), &cfg_in[OVERLAY]->color_spaces);
+    if (ret < 0)
+        return ret;
+    ret = ff_formats_ref(ff_all_color_spaces(), &cfg_out[0]->color_spaces);
+    if (ret < 0)
+        return ret;
+
+    ret = ff_formats_ref(ff_all_color_ranges(), &cfg_in[MAIN]->color_ranges);
+    if (ret < 0)
+        return ret;
+    ret = ff_formats_ref(ff_all_color_ranges(), &cfg_in[OVERLAY]->color_ranges);
+    if (ret < 0)
+        return ret;
+    ret = ff_formats_ref(ff_all_color_ranges(), &cfg_out[0]->color_ranges);
     if (ret < 0)
         return ret;
 
@@ -604,7 +663,7 @@ static int overlay_amf_activate(AVFilterContext *avctx)
 static const AVOption overlay_amf_options[] = {
     { "x", "Overlay x position", OFFSET(x_position), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, FLAGS },
     { "y", "Overlay y position", OFFSET(y_position), AV_OPT_TYPE_INT, { .i64 = 0 }, INT_MIN, INT_MAX, FLAGS },
-    { "alpha_blend", "Blend overlay alpha instead of copying it opaquely", OFFSET(enable_alpha_blend), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+    { "alpha_blend", "Blend overlay alpha/global alpha instead of copying it opaquely", OFFSET(enable_alpha_blend), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { "async_submit", "Submit alpha_blend Vulkan work asynchronously when AMF Vulkan sync is available", OFFSET(async_submit), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { "alpha", "alpha format", OFFSET(alpha_mode), AV_OPT_TYPE_INT, { .i64 = AVALPHA_MODE_UNSPECIFIED }, 0, AVALPHA_MODE_NB - 1, FLAGS, .unit = "alpha_mode" },
         { "auto",          "", 0, AV_OPT_TYPE_CONST, { .i64 = AVALPHA_MODE_UNSPECIFIED },   .flags = FLAGS, .unit = "alpha_mode" },
@@ -612,6 +671,10 @@ static const AVOption overlay_amf_options[] = {
         { "straight",      "", 0, AV_OPT_TYPE_CONST, { .i64 = AVALPHA_MODE_STRAIGHT },      .flags = FLAGS, .unit = "alpha_mode" },
         { "premultiplied", "", 0, AV_OPT_TYPE_CONST, { .i64 = AVALPHA_MODE_PREMULTIPLIED }, .flags = FLAGS, .unit = "alpha_mode" },
     { "premultiplied", "Compatibility alias for alpha mode: -1=auto, 0=straight, 1=premultiplied", OFFSET(premultiplied_alpha), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 1, FLAGS },
+    { "p010_debug", "Debug P010 alpha path by writing only one plane", OFFSET(p010_debug_mode), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 2, FLAGS, .unit = "p010_debug" },
+        { "off",     "", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, .flags = FLAGS, .unit = "p010_debug" },
+        { "y_only",  "", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, .flags = FLAGS, .unit = "p010_debug" },
+        { "uv_only", "", 0, AV_OPT_TYPE_CONST, { .i64 = 2 }, .flags = FLAGS, .unit = "p010_debug" },
     { "global_alpha", "Scale overlay alpha when alpha_blend=1", OFFSET(global_alpha), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0.0, 1.0, FLAGS },
     { "eof_action", "Action to take when encountering EOF from secondary input ",
         OFFSET(fs.opt_eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_REPEAT },

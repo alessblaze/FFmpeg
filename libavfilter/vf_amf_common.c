@@ -83,12 +83,14 @@ int amf_filter_filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterContext             *avctx = inlink->dst;
     AMFFilterContext             *ctx = avctx->priv;
     AVFilterLink                *outlink = avctx->outputs[0];
+    AVHWFramesContext           *hwframes_out = NULL;
     AMF_RESULT  res;
     AMFSurface *surface_in;
     AMFSurface *surface_out;
     AMFData *data_out = NULL;
     enum AVColorSpace out_colorspace;
     enum AVColorRange out_color_range;
+    const AVPixFmtDescriptor    *out_sw_desc = NULL;
 
     AVFrame *out = NULL;
     int ret = 0;
@@ -116,9 +118,26 @@ int amf_filter_filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     out = amf_amfsurface_to_avframe(avctx, surface_out);
+    if (ctx->hwframes_out_ref) {
+        hwframes_out = (AVHWFramesContext *)ctx->hwframes_out_ref->data;
+        out_sw_desc = av_pix_fmt_desc_get(hwframes_out->sw_format);
+    }
 
     ret = av_frame_copy_props(out, in);
     av_frame_unref(in);
+
+    // Reset YUV transfer function when output is RGB.
+    // RGB pixels are display-referred, not camera-encoded.
+    // Carrying HLG/PQ forward causes downstream converters to
+    // double-apply the EOTF, washing out colors.
+    if (ctx->normalize_rgb_trc &&
+        out_sw_desc &&
+        (out_sw_desc->flags & AV_PIX_FMT_FLAG_RGB)) {
+        if (out->color_trc == AVCOL_TRC_ARIB_STD_B67 ||
+            out->color_trc == AVCOL_TRC_SMPTE2084) {
+            out->color_trc = AVCOL_TRC_IEC61966_2_1;
+        }
+    }
 
     out_colorspace = AVCOL_SPC_UNSPECIFIED;
 

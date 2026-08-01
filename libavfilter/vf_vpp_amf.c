@@ -24,6 +24,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/internal.h"
+#include "libavutil/pixdesc.h"
 
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_amf.h"
@@ -68,6 +69,7 @@ static int amf_filter_query_formats(AVFilterContext *avctx)
         AV_PIX_FMT_D3D11,
         AV_PIX_FMT_DXVA2_VLD,
         AV_PIX_FMT_NV12,
+        AV_PIX_FMT_P010,
         AV_PIX_FMT_RGBAF16,
         AV_PIX_FMT_BGRA,
         AV_PIX_FMT_YUV420P,
@@ -98,6 +100,8 @@ static int amf_filter_config_output(AVFilterLink *outlink)
         return ret;
     // FIXME: add checks whether we have HW context
     hwframes_out = (AVHWFramesContext*)ctx->hwframes_out_ref->data;
+    ctx->normalize_rgb_trc = !!(av_pix_fmt_desc_get(hwframes_out->sw_format) &&
+                                (av_pix_fmt_desc_get(hwframes_out->sw_format)->flags & AV_PIX_FMT_FLAG_RGB));
     res = ctx->amf_device_ctx->factory->pVtbl->CreateComponent(ctx->amf_device_ctx->factory, ctx->amf_device_ctx->context, AMFVideoConverter, &ctx->component);
     AMF_RETURN_IF_FALSE(ctx, res == AMF_OK, AVERROR_FILTER_NOT_FOUND, "CreateComponent(%ls) failed with error %d\n", AMFVideoConverter, res);
     // FIXME: add checks whether we have HW context
@@ -151,6 +155,23 @@ static int amf_filter_config_output(AVFilterLink *outlink)
 
     if (ctx->in_trc != AMF_COLOR_TRANSFER_CHARACTERISTIC_UNDEFINED) {
         AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_INPUT_TRANSFER_CHARACTERISTIC, ctx->in_trc);
+    }
+
+    if (ctx->input_tonemapping != AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED) {
+        AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_INPUT_TONEMAPPING, ctx->input_tonemapping);
+    }
+
+    if (ctx->output_tonemapping != AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED) {
+        AMF_ASSIGN_PROPERTY_INT64(res, ctx->component, AMF_VIDEO_CONVERTER_OUTPUT_TONEMAPPING, ctx->output_tonemapping);
+    }
+
+    if (ctx->linear_rgb >= 0) {
+        AMF_ASSIGN_PROPERTY_BOOL(res, ctx->component, AMF_VIDEO_CONVERTER_LINEAR_RGB, ctx->linear_rgb);
+    }
+
+    if (ctx->use_decoder_hdr_metadata >= 0) {
+        AMF_ASSIGN_PROPERTY_BOOL(res, ctx->component, AMF_VIDEO_CONVERTER_USE_DECODER_HDR_METADATA,
+                                 ctx->use_decoder_hdr_metadata);
     }
 
     sd = av_frame_side_data_get(inlink->side_data, inlink->nb_side_data,
@@ -260,6 +281,19 @@ static const AVOption vpp_amf_options[] = {
     { "smpte2084",      "SMPTE2084",                0,  AV_OPT_TYPE_CONST, { .i64 = AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE2084 }, 0, 0, FLAGS, "trc" },
     { "smpte428",       "SMPTE428",                 0,  AV_OPT_TYPE_CONST, { .i64 = AMF_COLOR_TRANSFER_CHARACTERISTIC_SMPTE428 }, 0, 0, FLAGS, "trc" },
     { "arib-std-b67",   "ARIB_STD_B67",             0,  AV_OPT_TYPE_CONST, { .i64 = AMF_COLOR_TRANSFER_CHARACTERISTIC_ARIB_STD_B67 }, 0, 0, FLAGS, "trc" },
+
+    { "input_tonemapping",  "Input tone mapping",  OFFSET(input_tonemapping),  AV_OPT_TYPE_INT, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED }, AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED, AMF_VIDEO_CONVERTER_TONEMAPPING_2390, FLAGS, "tonemapping" },
+    { "output_tonemapping", "Output tone mapping (deprecated by AMF; use input_tonemapping when possible)", OFFSET(output_tonemapping), AV_OPT_TYPE_INT, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED }, AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED, AMF_VIDEO_CONVERTER_TONEMAPPING_2390, FLAGS, "tonemapping" },
+    { "undefined",      "Undefined",                0,  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_UNDEFINED }, 0, 0, FLAGS, "tonemapping" },
+    { "copy",           "Copy without tone mapping", 0, AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_COPY }, 0, 0, FLAGS, "tonemapping" },
+    { "amd",            "AMD tone mapping",         0,  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_AMD }, 0, 0, FLAGS, "tonemapping" },
+    { "linear",         "Linear tone mapping",      0,  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_LINEAR }, 0, 0, FLAGS, "tonemapping" },
+    { "gamma",          "Gamma tone mapping",       0,  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_GAMMA }, 0, 0, FLAGS, "tonemapping" },
+    { "reinhard",       "Reinhard tone mapping",    0,  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_REINHARD }, 0, 0, FLAGS, "tonemapping" },
+    { "bt2390",         "BT.2390 tone mapping",     0,  AV_OPT_TYPE_CONST, { .i64 = AMF_VIDEO_CONVERTER_TONEMAPPING_2390 }, 0, 0, FLAGS, "tonemapping" },
+
+    { "linear_rgb", "Convert to/from linear RGB using AMF converter control", OFFSET(linear_rgb), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, FLAGS },
+    { "use_decoder_hdr_metadata", "Use decoder/surface HDR metadata in AMF converter", OFFSET(use_decoder_hdr_metadata), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, FLAGS },
 
     { "force_original_aspect_ratio", "decrease or increase w/h if necessary to keep the original AR", OFFSET(force_original_aspect_ratio), AV_OPT_TYPE_INT, { .i64 = 0}, 0, SCALE_FORCE_OAR_NB-1, FLAGS, "force_oar" },
     { "disable",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = SCALE_FORCE_OAR_DISABLE  }, 0, 0, FLAGS, "force_oar" },

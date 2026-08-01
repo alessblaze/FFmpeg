@@ -26067,6 +26067,47 @@ SMPTE-432
 JEDEC P22 phosphors
 
 @end table
+
+@item input_tonemapping
+Set the AMF VideoConverter input tone mapping mode.
+
+@item output_tonemapping
+Set the AMF VideoConverter output tone mapping mode. This maps to the AMF
+@code{OutputTonemapping} property, which the AMF SDK marks as deprecated in
+favor of @code{InputTonemapping}.
+
+The accepted values for input_tonemapping and output_tonemapping are:
+@table @samp
+@item undefined
+Do not configure tone mapping explicitly.
+
+@item copy
+Copy without tone mapping.
+
+@item amd
+AMD tone mapping.
+
+@item linear
+Linear tone mapping.
+
+@item gamma
+Gamma tone mapping.
+
+@item reinhard
+Reinhard tone mapping.
+
+@item bt2390
+ITU-R BT.2390 tone mapping.
+
+@end table
+
+@item linear_rgb
+Set the AMF VideoConverter @code{LinearRGB} property. The default value
+@code{-1} leaves the property unset.
+
+@item use_decoder_hdr_metadata
+Set the AMF VideoConverter @code{UseDecoderHDRMetadata} property. The default
+value @code{-1} leaves the property unset.
 @end table
 
 @subsection Examples
@@ -26099,10 +26140,10 @@ Overlay one AMF video stream on top of another.
 
 This filter operates on AMF hardware frames and requires matching AMF
 surface formats on both inputs.
-The alpha blend path supports packed RGB AMF surfaces, while the native
-opaque copy path also supports same-format @code{nv12}, @code{yuv420p},
-and @code{p010} surfaces through the existing plane-aware Vulkan copy
-plumbing.
+The alpha blend path supports packed RGB AMF surfaces and same-format
+@code{p010} surfaces. The native opaque copy path also supports same-format
+@code{nv12}, @code{yuv420p}, and @code{p010} surfaces through the existing
+plane-aware Vulkan copy plumbing.
 If the negotiated inputs are not directly usable, the filter queries AMF
 VideoConverter caps on the active device and reports which @code{vpp_amf}
 conversion should be inserted before @code{overlay_amf}.
@@ -26120,19 +26161,25 @@ If set to 1, blend the overlay using its alpha channel on the GPU with a Vulkan
 compute shader.
 
 The fast alpha path accepts a packed RGB AMF surface on the main input and an
-alpha-bearing packed RGB AMF surface on the overlay input. This allows
-high-precision main surfaces such as @code{rgbaf16le} to
+alpha-bearing packed RGB AMF surface on the overlay input. It also accepts
+matching @code{p010} inputs, where alpha blending uses @code{global_alpha}
+as a plane-wide blend factor because @code{p010} carries no per-pixel alpha
+channel. This allows high-precision main surfaces such as @code{rgbaf16le} to
 blend with an @code{rgba} or @code{rgbaf16le} overlay without forcing the main
 path back through 8-bit @code{rgba}.
+Converting an alpha-bearing RGB asset to @code{p010} before @code{overlay_amf}
+discards its per-pixel alpha and leaves only YUV color data, so the @code{p010}
+path will blend the full overlay rectangle with @code{global_alpha} instead of
+recovering the original shaped alpha edges.
 If @code{alpha_blend=0}, the overlay is copied opaquely. Packed RGB AMF
 formats such as @code{BGRA}, @code{RGBA}, @code{BGR0}, and
 @code{rgbaf16le}, plus same-format @code{nv12}, @code{yuv420p}, and
 @code{p010}, are accepted as long as both inputs match.
 
 @item async_submit
-If set to 1 together with @code{alpha_blend=1}, submit the packed RGB Vulkan
-alpha blend asynchronously and rely on AMF Vulkan surface sync metadata to
-carry the dependency downstream. Default is 0.
+If set to 1 together with @code{alpha_blend=1}, submit Vulkan alpha blend work
+asynchronously and rely on AMF Vulkan surface sync metadata to carry the
+dependency downstream. Default is 0.
 
 @item alpha
 Set the overlay alpha mode used by @code{alpha_blend=1}. Accepted values are
@@ -26140,15 +26187,23 @@ Set the overlay alpha mode used by @code{alpha_blend=1}. Accepted values are
 
 With @code{alpha=auto}, @code{overlay_amf} follows FFmpeg's negotiated overlay
 alpha mode metadata when available and otherwise falls back to straight alpha.
+This option has no effect on the @code{p010} global-alpha path.
 
 @item premultiplied
 Compatibility alias for @code{alpha}. Accepted values are @code{-1} for
 @code{auto}, @code{0} for @code{straight}, and @code{1} for
 @code{premultiplied}. Default is @code{-1}.
+This option has no effect on the @code{p010} global-alpha path.
 
 @item global_alpha
-Scale the overlay alpha when @code{alpha_blend=1}. Range is from 0.0 to 1.0.
-Default is 1.0.
+Scale the overlay alpha when @code{alpha_blend=1}. On @code{p010} inputs this
+is the only alpha source. Range is from 0.0 to 1.0. Default is 1.0.
+
+@item p010_debug
+Debug the @code{p010} alpha path by restricting writes to a single plane.
+Accepted values are @code{off} (default), @code{y_only}, and @code{uv_only}.
+This is intended for diagnosing plane mapping or chroma behavior on matching
+@code{p010} inputs and has no effect on packed RGB paths.
 
 @item eof_action
 @item shortest
