@@ -26138,13 +26138,16 @@ vpp_amf=color_profile=bt2020:in_trc=smpte2084:in_primaries=bt2020:out_trc=bt709:
 
 Overlay one AMF video stream on top of another.
 
-This filter operates on AMF hardware frames.
+This filter operates on AMF hardware frames. Both inputs must belong to the
+same AMF device context.
 The alpha blend path supports matching packed RGB AMF surfaces, matching
 @code{p010} surfaces, and a mixed path with a @code{p010} main input plus a
 packed RGB overlay input.
 The native opaque copy path supports matching packed RGB, @code{nv12},
 @code{yuv420p}, and @code{p010} surfaces through the existing plane-aware
 Vulkan copy plumbing.
+For 4:2:0 surfaces, placement and processed dimensions are aligned down to the
+nearest even value so luma and chroma planes cover the same region.
 If the negotiated inputs are not directly usable, the filter queries AMF
 VideoConverter caps on the active device and reports which @code{vpp_amf}
 conversion should be inserted before @code{overlay_amf}.

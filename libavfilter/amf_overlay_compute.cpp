@@ -450,11 +450,15 @@ static amf::AMFVulkanView *get_packed_vulkan_view(amf::AMFSurface *surface, void
 
 static int floor_rshift_int(int value, unsigned shift)
 {
+    int64_t magnitude;
+
     if (!shift)
         return value;
     if (value >= 0)
         return value >> shift;
-    return -(((-value) + (1 << shift) - 1) >> shift);
+
+    magnitude = -(int64_t)value;
+    return -(int)((magnitude + (1LL << shift) - 1) >> shift);
 }
 
 static int ceil_rshift_positive_int(int value, unsigned shift)
@@ -462,6 +466,23 @@ static int ceil_rshift_positive_int(int value, unsigned shift)
     if (!shift)
         return value;
     return (value + (1 << shift) - 1) >> shift;
+}
+
+static int align_down_int(int value, unsigned shift)
+{
+    return floor_rshift_int(value, shift) * (1 << shift);
+}
+
+static int surface_format_is_420(amf::AMF_SURFACE_FORMAT format)
+{
+    switch (format) {
+    case amf::AMF_SURFACE_NV12:
+    case amf::AMF_SURFACE_YUV420P:
+    case amf::AMF_SURFACE_P010:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static int create_surface_plane_view(FFAMFOverlayComputeContext *ctx,
@@ -735,6 +756,11 @@ static int clamp_overlay_region(int main_width, int main_height,
     int dst_y = y_position;
     int copy_width = overlay_width;
     int copy_height = overlay_height;
+
+    if (main_width <= 0 || main_height <= 0 ||
+        overlay_width <= 0 || overlay_height <= 0 ||
+        dst_x <= -overlay_width || dst_y <= -overlay_height)
+        return 0;
 
     if (dst_x < 0) {
         src_x = -dst_x;
@@ -2590,6 +2616,34 @@ extern "C" int ff_amf_overlay_compute_run(FFAMFOverlayComputeContext *ctx,
 
     if (ctx->lock)
         ctx->lock(ctx->lock_ctx);
+
+    if (surface_format_is_420(main_surface->GetFormat())) {
+        int aligned_main_width = align_down_int(main_width, 1);
+        int aligned_main_height = align_down_int(main_height, 1);
+        int aligned_overlay_width = align_down_int(overlay_width, 1);
+        int aligned_overlay_height = align_down_int(overlay_height, 1);
+        int aligned_x = align_down_int(x_position, 1);
+        int aligned_y = align_down_int(y_position, 1);
+
+        if (aligned_main_width != main_width || aligned_main_height != main_height ||
+            aligned_overlay_width != overlay_width || aligned_overlay_height != overlay_height ||
+            aligned_x != x_position || aligned_y != y_position) {
+            av_log(ctx->log_ctx, AV_LOG_VERBOSE,
+                   "overlay_amf: aligned 4:2:0 ROI main=%dx%d overlay=%dx%d at (%d,%d) to main=%dx%d overlay=%dx%d at (%d,%d)\n",
+                   main_width, main_height, overlay_width, overlay_height,
+                   x_position, y_position,
+                   aligned_main_width, aligned_main_height,
+                   aligned_overlay_width, aligned_overlay_height,
+                   aligned_x, aligned_y);
+        }
+
+        main_width = aligned_main_width;
+        main_height = aligned_main_height;
+        overlay_width = aligned_overlay_width;
+        overlay_height = aligned_overlay_height;
+        x_position = aligned_x;
+        y_position = aligned_y;
+    }
 
     log_surface_plane_info("main", main_surface, ctx->log_ctx);
     log_surface_plane_info("overlay", overlay_surface, ctx->log_ctx);

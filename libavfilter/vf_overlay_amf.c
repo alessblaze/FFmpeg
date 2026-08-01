@@ -336,7 +336,6 @@ static void overlay_amf_log_conversion_hint(AVFilterContext *avctx,
 static int overlay_amf_output_surface(AVFilterContext *avctx, AVFilterLink *outlink,
                                       AVFrame *input_main, AMFSurface **main_surface)
 {
-    OverlayAMFContext *ctx = avctx->priv;
     AVFrame *out;
     int ret;
 
@@ -348,12 +347,6 @@ static int overlay_amf_output_surface(AVFilterContext *avctx, AVFilterLink *outl
     if (ret < 0) {
         av_frame_free(&out);
         return ret;
-    }
-
-    out->hw_frames_ctx = av_buffer_ref(ctx->common.hwframes_out_ref);
-    if (!out->hw_frames_ctx) {
-        av_frame_free(&out);
-        return AVERROR(ENOMEM);
     }
 
     out->alpha_mode = outlink->alpha_mode;
@@ -452,6 +445,7 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     AVHWFramesContext *main_fc;
     AVHWFramesContext *overlay_fc;
     AVAMFDeviceContext *device_ctx;
+    AVAMFDeviceContext *overlay_device_ctx;
     enum AVPixelFormat in_format;
     int main_is_packed_rgb;
     int overlay_is_packed_rgb;
@@ -473,6 +467,18 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     main_fc = (AVHWFramesContext *)main_inl->hw_frames_ctx->data;
     overlay_fc = (AVHWFramesContext *)overlay_inl->hw_frames_ctx->data;
     device_ctx = overlay_amf_get_device_ctx(main_fc);
+    overlay_device_ctx = overlay_amf_get_device_ctx(overlay_fc);
+    if (!device_ctx || !overlay_device_ctx) {
+        av_log(avctx, AV_LOG_ERROR,
+               "overlay_amf requires AMF hardware frame contexts on both inputs\n");
+        return AVERROR(EINVAL);
+    }
+    if (device_ctx->context != overlay_device_ctx->context) {
+        av_log(avctx, AV_LOG_ERROR,
+               "overlay_amf requires both inputs to use the same AMF device context\n");
+        return AVERROR(EXDEV);
+    }
+
     main_is_packed_rgb = overlay_amf_is_supported_packed_rgb_format(main_fc->sw_format);
     overlay_is_packed_rgb = overlay_amf_is_supported_packed_rgb_format(overlay_fc->sw_format);
     main_is_p010 = main_fc->sw_format == AV_PIX_FMT_P010;
@@ -527,7 +533,7 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
-    if (ctx->enable_alpha_blend && alpha_is_packed_rgb &&
+    if (ctx->enable_alpha_blend && (alpha_is_packed_rgb || alpha_is_p010_rgb) &&
         !ctx->overlay_has_alpha) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf alpha_blend=1 requires an alpha-bearing packed RGB overlay surface; got %s over %s\n",
