@@ -416,7 +416,9 @@ static int overlay_amf_blend(FFFrameSync *fs)
                                      ctx->async_submit,
                                      premultiplied_alpha,
                                      ctx->global_alpha,
-                                     ctx->p010_debug_mode);
+                                     ctx->p010_debug_mode,
+                                     input_main->colorspace,
+                                     input_main->color_range);
     if (ret < 0)
         goto fail;
 
@@ -457,6 +459,7 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     int overlay_is_p010;
     int alpha_is_packed_rgb;
     int alpha_is_p010;
+    int alpha_is_p010_rgb;
     int main_is_opaque_format;
     int overlay_is_opaque_format;
     const char *path_name;
@@ -476,13 +479,14 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     overlay_is_p010 = overlay_fc->sw_format == AV_PIX_FMT_P010;
     alpha_is_packed_rgb = main_is_packed_rgb && overlay_is_packed_rgb;
     alpha_is_p010 = main_is_p010 && overlay_is_p010;
+    alpha_is_p010_rgb = main_is_p010 && overlay_is_packed_rgb;
     main_is_opaque_format = overlay_amf_is_supported_opaque_format(main_fc->sw_format);
     overlay_is_opaque_format = overlay_amf_is_supported_opaque_format(overlay_fc->sw_format);
 
     if (ctx->enable_alpha_blend) {
-        if (!alpha_is_packed_rgb && !alpha_is_p010) {
+        if (!alpha_is_packed_rgb && !alpha_is_p010 && !alpha_is_p010_rgb) {
             av_log(avctx, AV_LOG_ERROR,
-                   "overlay_amf alpha_blend=1 requires matching packed RGB AMF surfaces or matching p010 AMF surfaces; got %s and %s\n",
+                   "overlay_amf alpha_blend=1 requires matching packed RGB AMF surfaces, matching p010 AMF surfaces, or p010 main with packed RGB overlay; got %s and %s\n",
                    overlay_amf_pix_fmt_name(main_fc->sw_format),
                    overlay_amf_pix_fmt_name(overlay_fc->sw_format));
             if (!main_is_packed_rgb && !main_is_p010)
@@ -512,7 +516,8 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     ctx->main_surface_format = av_av_to_amf_format(main_fc->sw_format);
     ctx->overlay_has_alpha = overlay_amf_sw_format_has_alpha(overlay_fc->sw_format);
 
-    if (ctx->main_surface_format != av_av_to_amf_format(overlay_fc->sw_format)) {
+    if (!alpha_is_p010_rgb &&
+        ctx->main_surface_format != av_av_to_amf_format(overlay_fc->sw_format)) {
         av_log(avctx, AV_LOG_ERROR,
                "overlay_amf requires matching AMF surface formats; got %s and %s\n",
                overlay_amf_pix_fmt_name(main_fc->sw_format),
@@ -539,6 +544,7 @@ static int overlay_amf_config_output(AVFilterLink *outlink)
     ctx->common.reset_sar = 0;
 
     path_name = ctx->enable_alpha_blend && alpha_is_p010 ? "P010 global-alpha blend" :
+                ctx->enable_alpha_blend && alpha_is_p010_rgb ? "P010 RGB-alpha blend" :
                 ctx->enable_alpha_blend ? "alpha blend" : "native opaque copy";
     av_log(avctx, AV_LOG_VERBOSE,
            "overlay_amf: using %s AMF surfaces directly on the %s path; no vpp_amf pre-conversion required\n",
